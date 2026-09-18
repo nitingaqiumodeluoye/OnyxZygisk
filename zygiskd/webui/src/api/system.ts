@@ -223,11 +223,27 @@ export async function fetchLogs(lines: number | string): Promise<string> {
   const parsed = parseInt(String(lines), 10);
   const n = Math.min(300, Math.max(20, Number.isFinite(parsed) ? parsed : 120));
   const readLimit = Math.min(500, Math.max(n * 3, 120));
+  // The daemon tag carries an ABI suffix on real devices ("zygiskd64" on the
+  // 64-bit daemon, "zygisk-core64" on the injector) and the injector tags use
+  // the same convention. A bare "zygiskd:*" -s filter only ever matches a
+  // host-side run, so the tag filter silently dropped every real line — the
+  // command exited 0 with empty output, and on WebUI bridges whose shell
+  // reports a non-zero errno for a benign empty pipeline this surfaced as
+  // "read logs failed". Match the family prefix instead of exact tags.
+  // No -t window: the daemon logs at boot, and by the time the user opens the
+  // page the ring buffer may hold thousands of newer lines, so a tail window
+  // would miss them entirely. Grep the full dump and tail the matches.
+  // Some WebUI bridge shells run with a bare PATH; resolve logcat explicitly
+  // before falling back to its standard absolute location.
   const r = await exec(
-    `logcat -d -v brief -t ${readLimit} -s zygiskd:* zygisk-sh:* 2>/dev/null | grep -E '${MODULE_LOG_PATTERN}' | tail -n ${n}`,
+    `lc="$(command -v logcat 2>/dev/null)"; [ -n "$lc" ] || lc=/system/bin/logcat; "$lc" -d -v brief 2>/dev/null | grep -E 'zygiskd|zygisk-core|zygisk-sh' | grep -E '${MODULE_LOG_PATTERN}' | tail -n ${n}`,
   );
   const logcatOut = r.stdout.trim();
-  if (logcatOut || r.errno === 0) return logcatOut;
+  if (logcatOut) return logcatOut;
+  // A clean exit with no matching lines is a legitimate empty log (fresh
+  // boot, no hot-plug/FN activity yet) — show the empty panel instead of an
+  // error. Only fall through when the command itself failed.
+  if (r.errno === 0) return logcatOut;
 
   // Some root-manager WebUI bridges report a non-zero errno for `logcat`, or
   // run in a context where logcat is unavailable. KernelSU already captures a
@@ -239,7 +255,7 @@ export async function fetchLogs(lines: number | string): Promise<string> {
     `pat='${MODULE_LOG_PATTERN}'`,
     "for f in /data/adb/ksu/log/logcat.log /data/adb/ksu/log/logcat.old.log; do",
     '  [ -r "$f" ] || continue',
-    '  tail -n "$read" "$f" 2>/dev/null | grep -E "zygiskd|zygisk-sh" | grep -E "$pat" | tail -n "$n"',
+    '  tail -n "$read" "$f" 2>/dev/null | grep -E "zygiskd|zygisk-core|zygisk-sh" | grep -E "$pat" | tail -n "$n"',
     "  exit 0",
     "done",
     ":",
@@ -249,6 +265,15 @@ export async function fetchLogs(lines: number | string): Promise<string> {
   if (fallbackOut || fb.errno === 0) return fallbackOut;
 
   const detail = (r.stderr || fb.stderr || r.stdout || fb.stdout).trim();
+  // Last resort before an error: the workdir status file is written by the
+  // monitor itself and needs no logcat access at all. On bridges where both
+  // logcat paths fail (APatch shells that report a non-zero errno for empty
+  // pipelines), showing the live monitor rows beats a red error box.
+  const status = await exec(`cat '${WORKDIR}/module.prop' 2>/dev/null`);
+  const monitorOut = parseMonitor(status.stdout).map((row) => row.label ? `${row.label}: ${row.value}` : row.value).join("\n");
+  if (monitorOut) {
+    return `logcat unavailable on this bridge (exit ${r.errno}); live monitor status:\n${monitorOut}`;
+  }
   throw new Error(detail || `read logs failed (exit ${r.errno})`);
 }
 

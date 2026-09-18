@@ -111,8 +111,9 @@ describe("fetchLogs", () => {
     });
 
     await expect(fetchLogs(200)).resolves.toBe("I/zygiskd: Hot-plug: swapped staged module");
-    expect(vi.mocked(exec).mock.calls[0][0]).toContain("-s zygiskd:* zygisk-sh:*");
-    expect(vi.mocked(exec).mock.calls[0][0]).not.toContain("zygisk-core");
+    expect(vi.mocked(exec).mock.calls[0][0]).toContain("grep -E 'zygiskd|zygisk-core|zygisk-sh'");
+    expect(vi.mocked(exec).mock.calls[0][0]).toContain("command -v logcat");
+    expect(vi.mocked(exec).mock.calls[0][0]).toContain("/system/bin/logcat");
   });
 
   it("falls back to KernelSU log snapshots when logcat is unavailable", async () => {
@@ -123,7 +124,7 @@ describe("fetchLogs", () => {
     await expect(fetchLogs(200)).resolves.toBe("I/zygiskd: Module script stdout");
     expect(vi.mocked(exec).mock.calls[1][0]).toContain("/data/adb/ksu/log/logcat.log");
     expect(vi.mocked(exec).mock.calls[1][0]).toContain('tail -n "$read"');
-    expect(vi.mocked(exec).mock.calls[1][0]).toContain('grep -E "zygiskd|zygisk-sh"');
+    expect(vi.mocked(exec).mock.calls[1][0]).toContain('grep -E "zygiskd|zygisk-core|zygisk-sh"');
   });
 
   it("returns an empty log instead of an error when no log source is readable", async () => {
@@ -132,6 +133,28 @@ describe("fetchLogs", () => {
       .mockResolvedValueOnce({ errno: 0, stdout: "", stderr: "" });
 
     await expect(fetchLogs(200)).resolves.toBe("");
+  });
+
+  it("falls back to the live monitor status when logcat and snapshots both fail", async () => {
+    vi.mocked(exec)
+      .mockResolvedValueOnce({ errno: 1, stdout: "", stderr: "logcat denied" })
+      .mockResolvedValueOnce({ errno: 1, stdout: "", stderr: "denied" })
+      .mockResolvedValueOnce({
+        errno: 0,
+        stdout: "\tmonitor:\ttracing\n\tzygote64:\tinjected\n",
+        stderr: "",
+      });
+
+    const out = await fetchLogs(200);
+    expect(out).toContain("logcat unavailable");
+    expect(out).toContain("monitor: tracing");
+    expect(out).toContain("zygote64: injected");
+  });
+
+  it("throws when every source including the status file is unavailable", async () => {
+    vi.mocked(exec).mockResolvedValue({ errno: 1, stdout: "", stderr: "denied" });
+    // The thrown detail prefers the shell's stderr over the generic message.
+    await expect(fetchLogs(200)).rejects.toThrow("denied");
   });
 });
 
