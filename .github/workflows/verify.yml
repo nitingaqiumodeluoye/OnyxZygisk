@@ -31,16 +31,9 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.14.1
-      # Zig rebuilds the whole std/core graph on every run without this.
-      - name: Cache Zig artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/zig
-            loader/zigcore/.zig-cache
-          key: zig-${{ runner.os }}-0.14.1-${{ hashFiles('loader/zigcore/build.zig.zon') }}
-          restore-keys: |
-            zig-${{ runner.os }}-0.14.1-
+      # mlugg/setup-zig already caches the Zig install and both the global
+      # and local Zig cache directories (use-cache defaults to true), so no
+      # extra actions/cache step is needed here.
       - name: Run Zig tests
         working-directory: loader/zigcore
         run: zig build test --summary all
