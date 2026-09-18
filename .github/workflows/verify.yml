@@ -20,36 +20,88 @@ permissions:
   contents: read
 
 jobs:
+  # Stage 1: decide which parts of the tree changed. Its only job is to run
+  # before everything else and produce booleans the other jobs can gate on.
+  # `dorny/paths-filter` calls the GitHub REST "list files" API, which reports
+  # up to 3000 changed files and therefore does not depend on the shallow
+  # clone checkout performs here.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      android: ${{ steps.filter.outputs.android }}
+      webui: ${{ steps.filter.outputs.webui }}
+      zigcore: ${{ steps.filter.outputs.zigcore }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            android:
+              - 'module/**'
+              - 'loader/**'
+              - 'zygiskd/**'
+              - 'build.gradle.kts'
+              - 'settings.gradle.kts'
+              - 'gradle/**'
+              - 'gradlew'
+              - 'gradlew.bat'
+              - '.github/workflows/verify.yml'
+            webui:
+              - 'zygiskd/webui/**'
+              - '.github/workflows/verify.yml'
+            zigcore:
+              - 'loader/zigcore/**'
+              - '.github/workflows/verify.yml'
+      # Print the decision so a skipped job is easy to explain from the log.
+      - name: Summary
+        run: |
+          {
+            echo "### Changed areas"
+            echo ""
+            echo "| Area | Run? |"
+            echo "| --- | --- |"
+            echo "| android | ${{ steps.filter.outputs.android }} |"
+            echo "| webui | ${{ steps.filter.outputs.webui }} |"
+            echo "| zigcore | ${{ steps.filter.outputs.zigcore }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   zigcore:
     name: Zig core tests
+    needs: changes
+    if: needs.changes.outputs.zigcore == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
+      # mlugg/setup-zig already caches the Zig install and both the global and
+      # local Zig cache directories (use-cache defaults to true), so no extra
+      # actions/cache step is needed here.
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.14.1
-      # mlugg/setup-zig already caches the Zig install and both the global
-      # and local Zig cache directories (use-cache defaults to true), so no
-      # extra actions/cache step is needed here.
       - name: Run Zig tests
         working-directory: loader/zigcore
         run: zig build test --summary all
 
   webui:
     name: WebUI checks
+    needs: changes
+    if: needs.changes.outputs.webui == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 11.17.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: pnpm
@@ -69,33 +121,48 @@ jobs:
 
   android:
     name: Android release package
+    needs: changes
+    if: needs.changes.outputs.android == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           # build.gradle.kts derives verCode from `git rev-list HEAD --count`,
           # which returns 1 on the default shallow (fetch-depth: 1) clone.
           fetch-depth: 0
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: 21
-      # Caches ~/.gradle/caches and the wrapper distribution across runs.
-      - uses: gradle/actions/setup-gradle@v4
+      # Pinned to v5 on purpose: v6 extracted the caching code into
+      # `gradle-actions-caching`, a proprietary component under the Gradle
+      # Terms of Use rather than MIT. v5 still ships the MIT cache and already
+      # runs on node24, so it clears the node20 deprecation warning too.
+      - uses: gradle/actions/setup-gradle@v5
       - uses: android-actions/setup-android@v4
       - name: Install Android toolchain
         run: sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" "cmake;3.22.1" "ndk;27.2.12479018"
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: 1.85.0
           target: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+          # v2 flipped the default: it no longer sets RUSTFLAGS=-D warnings and
+          # instead relies on the `build.warnings` config via
+          # CARGO_BUILD_WARNINGS. That config needs cargo >= 1.97 while this
+          # project pins Rust 1.85, so the deny-warnings policy has to be
+          # expressed through RUSTFLAGS, exactly as it was with v1. Without
+          # this the warning gate would silently disappear.
+          rustflags: -D warnings
+          # Turn the cargo-1.97-only mechanism off explicitly so that a future
+          # Rust upgrade cannot silently re-enable it behind our back.
+          build-warnings: ""
       # Dependency sources plus the cargo-ndk target dir used by :zygiskd.
       # The key folds in build.gradle.kts because the pinned NDK version lives
       # there, and NDK changes must not reuse artifacts built by the old one.
       - name: Cache Rust dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -121,10 +188,10 @@ jobs:
           # cargo-ndk is a cargo subcommand: invoked directly it refuses to run
           # ("This binary may only be called via `cargo ndk`"), so ask cargo.
           cargo ndk --version
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 11.17.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: pnpm
@@ -137,7 +204,7 @@ jobs:
           RUSTFLAGS: ""
         run: bash ./gradlew :module:zipRelease --no-daemon --console=plain
       - name: Upload module ZIP
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: onyxzygisk-release
           path: module/build/outputs/release/*.zip
