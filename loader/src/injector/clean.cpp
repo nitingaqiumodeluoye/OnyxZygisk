@@ -1,8 +1,11 @@
 #include <linux/mman.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstring>
+#include <string>
 #include <string_view>
 
 #include <lsplt.hpp>
@@ -33,44 +36,133 @@ void clean_linker_trace(const char *path, size_t loaded_modules, size_t unloaded
     }
 }
 
+// ---------------------------------------------------------------------------
+// PR_SET_VMA anon naming
+//
+// mremap-ing a file-backed mapping into an anonymous one removes its pathname,
+// but what remains is a *nameless* anonymous segment. A nameless anon r-xp
+// region is itself a heuristic: stock processes name theirs ([anon:dalvik-*],
+// [anon:libc_malloc], ...), so "executable anonymous mapping with no name" is a
+// narrowing signal. Naming the region with PR_SET_VMA_ANON_NAME is what the
+// kernel-side helpers key on (see kAnonName), and it keeps the range from
+// looking like a bare anonymous executable mapping even without them.
+//
+// Two kernel details matter and are easy to get wrong:
+//
+//  * The name is only rendered for mappings without a backing file. Calling
+//    this on a still file-backed VMA returns 0 and silently prints the path
+//    instead, so the call must run *after* the mremap, never before.
+//  * On the 4.19-era kernels this project targets, the kernel stores the *user
+//    pointer* rather than copying the string (mm_types.h: `const char __user
+//    *anon_name`) and reads it back lazily through get_user_pages_remote when
+//    /proc/<pid>/maps is printed. Pointing it at .rodata works only while the
+//    library is mapped — and this library unmaps itself at the end of
+//    specialize (see hook.cpp). A pointer into our own image would then render
+//    as `[anon:<fault>]`, which is a *worse* fingerprint than no name at all.
+//    The name therefore lives in a permanent anonymous page that outlives the
+//    library.
+#ifndef PR_SET_VMA
+#define PR_SET_VMA 0x53564d41
+#endif
+#ifndef PR_SET_VMA_ANON_NAME
+#define PR_SET_VMA_ANON_NAME 0
+#endif
+
+/// Name given to the regions we anonymise. The `wwb_` prefix is not cosmetic:
+/// kernel-side helpers (karinahide's KARINA_MARKER, xfvmahide's
+/// XF_VMAHIDE_MARKER, hidemaps' `strstr("wwb_")`) filter /proc/<pid>/maps on
+/// that prefix *globally* and drop the whole record when it matches — which is
+/// more thorough than blanking the pathname, since an unnamed but still
+/// *executable* anonymous region is exactly what LSPLant-trampoline and
+/// InMemoryDex heuristics look for. Where no such helper is installed the name
+/// still helps: the range shows up as an explicitly named `[anon:wwb_hidden]`
+/// segment instead of an anonymous executable one with no name at all.
+static constexpr const char *kAnonName = "wwb_hidden";
+
+/// Labels the range with kAnonName. Returns the resident name page that the
+/// kernel now points at, or nullptr when naming was not possible.
+static const char *name_anon_region(void *addr, size_t size) {
+    // A small pool, never freed: the kernel may dereference these at any later
+    // read of /proc/<pid>/maps, so freeing them would surface as
+    // `[anon:<fault>]`. Separate pages keep each named region independent.
+    constexpr size_t kPoolSize = 4;
+    static char *pool[kPoolSize] = {};
+    static size_t next = 0;
+
+    char *&slot = pool[next++ % kPoolSize];
+    if (slot == nullptr) {
+        void *mem = mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+        if (mem == MAP_FAILED) {
+            PLOGE("failed to allocate a resident anon-name page; skipping naming");
+            return nullptr;
+        }
+        slot = static_cast<char *>(mem);
+        memcpy(slot, kAnonName, strlen(kAnonName) + 1);
+    }
+
+    if (prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, reinterpret_cast<unsigned long>(addr), size,
+              reinterpret_cast<unsigned long>(slot)) != 0) {
+        // Kernels without PR_SET_VMA (pre-5.17) fail here; the region is still
+        // anonymised, so this is a soft failure rather than an error.
+        LOGV("PR_SET_VMA_ANON_NAME unsupported for [%p, %p]: %s", addr,
+             static_cast<void *>(static_cast<char *>(addr) + size), strerror(errno));
+        return nullptr;
+    }
+    return slot;
+}
+
+/// Anonymises a range in place: copy it to an anonymous page, then mremap that
+/// page over the original address. Shared by both sweeps below.
+static bool anonymize_range(void *addr, size_t size, int perms, const std::string &path) {
+    // Create an anonymous mapping to hold a copy of the original data
+    void *copy = mmap(nullptr, size, PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (copy == MAP_FAILED) {
+        LOGE("failed to backup block %s [%p, %p]", path.c_str(), addr,
+             static_cast<void *>(static_cast<char *>(addr) + size));
+        return false;
+    }
+    // Ensure the original mapping is readable before copying
+    if ((perms & PROT_READ) == 0) {
+        mprotect(addr, size, PROT_READ);
+    }
+    memcpy(copy, addr, size);
+    // Overwrite the original mapping with our anonymous copy
+    if (mremap(copy, size, size, MREMAP_MAYMOVE | MREMAP_FIXED, addr) == MAP_FAILED) {
+        LOGE("mremap failed for %s [%p, %p]", path.c_str(), addr,
+             static_cast<void *>(static_cast<char *>(addr) + size));
+        munmap(copy, size);
+        return false;
+    }
+    // The backup copy is now at the original address, we can unmap our temporary one.
+    // Note: The man page for mremap is ambiguous on whether the old mapping at 'copy'
+    // is unmapped. To be safe and avoid potential leaks, we explicitly unmap it.
+    munmap(copy, size);
+    return true;
+}
+
 void spoof_virtual_maps(const char *path, bool clear_write_permission) {
     // spoofing map path names is futile in Android, we do it simply
     // to avoid trivial Zygisk detections based on string comparison.
     for (auto &map : lsplt::MapInfo::Scan()) {
         void *addr = (void *) map.start;
         size_t size = map.end - map.start;
+        int perms = map.perms;
 
         if (strstr(map.path.c_str(), path)) {
             LOGV("spoofing entry path contaning string %s", map.path.c_str());
-            // Create an anonymous mapping to hold a copy of the original data
-            void *copy = mmap(nullptr, size, PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-            if (copy == MAP_FAILED) {
-                LOGE("failed to backup block %s [%p, %p]", map.path.c_str(), addr,
-                     (void *) map.end);
-                continue;
+            if (anonymize_range(addr, size, perms, map.path)) {
+                // Only meaningful once the mapping is anonymous: a file-backed
+                // VMA returns success but never renders the name.
+                name_anon_region(addr, size);
             }
-            // Ensure the original mapping is readable before copying
-            if ((map.perms & PROT_READ) == 0) {
-                mprotect(addr, size, PROT_READ);
-            }
-            memcpy(copy, addr, size);
-            // Overwrite the original mapping with our anonymous copy
-            if (mremap(copy, size, size, MREMAP_MAYMOVE | MREMAP_FIXED, addr) == MAP_FAILED) {
-                LOGE("mremap failed for %s [%p, %p]", map.path.c_str(), addr, (void *) map.end);
-            }
-            // The backup copy is now at the original address, we can unmap our temporary one.
-            // Note: The man page for mremap is ambiguous on whether the old mapping at 'copy'
-            // is unmapped. To be safe and avoid potential leaks, we explicitly unmap it.
-            munmap(copy, size);
             // Restore the original permissions
-            mprotect(addr, size, map.perms);
+            mprotect(addr, size, perms);
         }
 
         if (clear_write_permission && map.path.size() > 0 &&
-            (map.perms & (PROT_READ | PROT_WRITE | PROT_EXEC)) ==
-                (PROT_READ | PROT_WRITE | PROT_EXEC)) {
+            (perms & (PROT_READ | PROT_WRITE | PROT_EXEC)) == (PROT_READ | PROT_WRITE | PROT_EXEC)) {
             LOGV("clearing write permission for entry %s", map.path.c_str());
-            int new_perms = map.perms & ~PROT_WRITE;  // Remove the write permission
+            int new_perms = perms & ~PROT_WRITE;  // Remove the write permission
             if (mprotect(addr, size, new_perms) == -1) {
                 PLOGE("remove write permission from %s [%p, %p]", map.path.c_str(), addr,
                       (void *) map.end);
