@@ -1,13 +1,29 @@
 name: Verify
 
 on:
+  # Branch filter matters: without it every push to every topic branch runs the
+  # full Android job (SDK + NDK + Rust + Gradle), which is by far the most
+  # expensive job in this workflow.
   push:
+    branches:
+      - master
+      - main
   pull_request:
+
+# A new push to the same branch supersedes the previous run; cancel it instead
+# of letting two Android builds compete for the same cache keys.
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   zigcore:
     name: Zig core tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -15,6 +31,16 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.14.1
+      # Zig rebuilds the whole std/core graph on every run without this.
+      - name: Cache Zig artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            loader/zigcore/.zig-cache
+          key: zig-${{ runner.os }}-0.14.1-${{ hashFiles('loader/zigcore/build.zig.zon') }}
+          restore-keys: |
+            zig-${{ runner.os }}-0.14.1-
       - name: Run Zig tests
         working-directory: loader/zigcore
         run: zig build test --summary all
@@ -22,6 +48,7 @@ jobs:
   webui:
     name: WebUI checks
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -50,14 +77,20 @@ jobs:
   android:
     name: Android release package
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          # build.gradle.kts derives verCode from `git rev-list HEAD --count`,
+          # which returns 1 on the default shallow (fetch-depth: 1) clone.
+          fetch-depth: 0
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 21
+      # Caches ~/.gradle/caches and the wrapper distribution across runs.
+      - uses: gradle/actions/setup-gradle@v4
       - uses: android-actions/setup-android@v3
       - name: Install Android toolchain
         run: sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" "cmake;3.22.1" "ndk;27.2.12479018"
@@ -65,8 +98,34 @@ jobs:
         with:
           toolchain: 1.85.0
           target: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --version 3.5.4 --locked
+      # Dependency sources plus the cargo-ndk target dir used by :zygiskd.
+      # The key folds in build.gradle.kts because the pinned NDK version lives
+      # there, and NDK changes must not reuse artifacts built by the old one.
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            zygiskd/build/rust/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('zygiskd/Cargo.lock', 'build.gradle.kts') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+      # Prebuilt binary instead of `cargo install`, which would compile
+      # cargo-ndk from source (~1.5-3 min) on every single run.
+      - name: Install cargo-ndk (prebuilt)
+        run: |
+          set -euo pipefail
+          VERSION=4.1.2
+          TRIPLE=x86_64-unknown-linux-gnu
+          ARCHIVE="cargo-ndk-${TRIPLE}-v${VERSION}.tgz"
+          SHA256=9451622c4567e8abb2c8005001855e32901c0b716ccdd3a173a4375fd03426e1
+          curl -fsSL -o "/tmp/${ARCHIVE}" \
+            "https://github.com/bbqsrc/cargo-ndk/releases/download/v${VERSION}/${ARCHIVE}"
+          echo "${SHA256}  /tmp/${ARCHIVE}" | sha256sum -c -
+          tar -xzf "/tmp/${ARCHIVE}" -C /tmp
+          install -m 0755 "/tmp/cargo-ndk-${TRIPLE}-v${VERSION}/cargo-ndk" "${CARGO_HOME:-$HOME/.cargo}/bin/cargo-ndk"
+          cargo-ndk --version
       - uses: pnpm/action-setup@v4
         with:
           version: 11.17.0
@@ -87,3 +146,5 @@ jobs:
         with:
           name: onyxzygisk-release
           path: module/build/outputs/release/*.zip
+          if-no-files-found: error
+          retention-days: 14
