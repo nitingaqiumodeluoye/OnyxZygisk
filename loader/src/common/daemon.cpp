@@ -179,7 +179,15 @@ int GetModuleDir(size_t index, const char *name) {
     // the name pins the request to the module itself. Older daemons read just
     // the index and ignore the trailing bytes.
     socket_utils::write_string(fd, name == nullptr ? std::string_view{} : std::string_view{name});
-    return socket_utils::recv_fd(fd);
+    int dir_fd = socket_utils::recv_fd(fd);
+    if (dir_fd < 0) {
+        // The daemon answered but sent no descriptor. Modules that resolve their
+        // payload through this fd treat the failure as fatal, so this is the one
+        // line that explains a downstream abort.
+        LOGE("GetModuleDir: daemon returned no directory fd for module %s (index %zu)",
+             name == nullptr ? "?" : name, index);
+    }
+    return dir_fd;
 }
 
 void ZygoteRestart() {
