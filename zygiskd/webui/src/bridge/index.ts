@@ -85,13 +85,24 @@ export async function exec(cmd: string): Promise<ExecResult> {
   // Preserve the wrapped command's exit status. Piping straight into `base64`
   // makes the pipeline report base64's (usually zero) status, which previously
   // turned every failed write/hot-plug command into a fake success.
+  //
+  // The trailing exit runs in a SUBSHELL: `(exit "$rc")`, never a bare
+  // `exit "$rc"`. The KernelSU/APatch bridge backs ksu.exec with a persistent
+  // libsu root shell, so an unqualified exit terminates that shell and every
+  // later call comes back as errno -1 with empty output in a few milliseconds
+  // (the dashboard then shows "status command returned incomplete data (exit
+  // -1)" on every panel, permanently, until the manager process is restarted).
+  // Older APatch managers built a throwaway shell per call, which is why this
+  // only broke after the manager switched to a shared singleton shell. A
+  // subshell still propagates $rc as the command's status while leaving the
+  // parent shell alive.
   const wrapped = [
     'out="$({',
     cmd,
     '} 2>&1)"',
     "rc=$?",
     'printf "%s" "$out" | base64',
-    'exit "$rc"',
+    '(exit "$rc")',
   ].join("\n");
   const r = await bridgeRaw(wrapped);
   return { errno: r.errno, stdout: b64ToUtf8(r.stdout), stderr: r.stderr };
