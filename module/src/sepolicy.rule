@@ -2,6 +2,15 @@ type zygisk_file file_type
 typeattribute zygisk_file mlstrustedobject
 allow zygote zygisk_file sock_file {read write}
 
+# Post-specialization live loader: connect to the existing daemon through a
+# retained directory fd and receive module memfds / getModuleDir descriptors.
+allow system_server zygisk_file sock_file {read write}
+allow system_server zygote unix_stream_socket connectto
+allow system_server {zygote magisk su} fd use
+allow system_server {tmpfs appdomain_tmpfs} file {read open getattr map execute}
+allow system_server adb_data_file dir {read open search getattr}
+allow system_server adb_data_file file {read open getattr map}
+
 allow zygote magisk lnk_file read
 allow zygote unlabeled file {read open}
 allow zygote zygote capability sys_chroot
