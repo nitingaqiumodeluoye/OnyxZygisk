@@ -30,8 +30,21 @@ pub const MAX_LOG_LEVEL: LevelFilter = LevelFilter::Trace;
 #[cfg(not(debug_assertions))]
 pub const MAX_LOG_LEVEL: LevelFilter = LevelFilter::Info;
 
-/// The relative path to the directory where Zygisk modules are stored.
-pub const PATH_MODULES_DIR: &str = "..";
+/// Absolute path to the directory where Zygisk modules are stored.
+///
+/// Must stay absolute. It used to be the relative `".."`, which only worked
+/// because the daemon is started by `service.sh` after `cd "$MODDIR"`, so its
+/// cwd is `modules/onyxzygisk` and `..` resolved to `modules/`. The WebUI runs
+/// hot-plug through a separate `zygiskd hotplug` CLI process whose cwd is `/`,
+/// so `..` resolved to the filesystem root there and the activation `rename`
+/// from `PATH_MODULES_UPDATE_DIR` became a cross-device move:
+///
+///     Hot-plug apply failed: failed to move staged module into
+///     ../<name>: Cross-device link (os error 18)
+///
+/// `/data/adb` and `/` live on different mounts, hence EXDEV. Keep this
+/// absolute so no caller depends on the process cwd.
+pub const PATH_MODULES_DIR: &str = "/data/adb/modules";
 /// Absolute path to the staging directory KernelSU's `ksud` and APatch's
 /// `apd` both extract new/updated modules into, ahead of swapping them into
 /// `PATH_MODULES_DIR` at the next boot. Consulted directly — once that root
