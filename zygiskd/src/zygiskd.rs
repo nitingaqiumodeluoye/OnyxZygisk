@@ -19,7 +19,7 @@ use log::{debug, error, info, trace, warn};
 use passfd::FdPassingExt;
 use rustix::io::{FdFlags, fcntl_setfd};
 use std::fs;
-use std::io::{Error, ErrorKind};
+use std::io::{Error, ErrorKind, Read};
 use std::os::fd::AsRawFd;
 use std::os::fd::{AsFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
@@ -1685,24 +1685,89 @@ fn handle_request_fn_companion_socket(
     Ok(())
 }
 
+/// Reads the module name that current loaders append to `GetModuleDir`.
+///
+/// A loader built before that field existed sends only the index and then waits
+/// for the fd, so an unconditional `read_string` would block until the peer gave
+/// up.  The timeout guards only the length read — that is what tells the two
+/// request shapes apart; once a length has arrived the payload is in flight and
+/// is read without a deadline.
+fn read_optional_module_name(stream: &mut UnixStream) -> Option<String> {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+    let len = stream.read_usize();
+    let _ = stream.set_read_timeout(None);
+    let len = len.ok()?;
+    if len == 0 || len > 255 {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf).ok()?;
+    String::from_utf8(buf).ok()
+}
+
+/// Resolve the directory that Zygisk API v5's `getModuleDir()` should hand back.
+///
+/// The loader sends the index the module had in the list streamed to it *and*
+/// the module's name; the name is authoritative.  The index cannot be trusted:
+/// this path recomputes `eligible_modules()` for every request, while the
+/// streamed list comes from `load_modules()`, which additionally drops entries
+/// whose memfd could not be created.  Membership also moves on its own — a
+/// hot-plug opt-in flip adds or removes a module, and a staged update that
+/// existed when the list was built can be swapped into the active directory
+/// before this call.  Either shift lands the index on a different module.
+///
+/// Failing or mis-resolving is fatal for a module that finds its own payload
+/// through this fd: ZygoteLoader (HMA-OSS) wraps the result in an `RAIIFD` whose
+/// constructor `fatal_assert`s on -1, so a directory that cannot be opened
+/// aborts the caller.  From `preServerSpecialize` that caller is zygote, which
+/// turns the failure into a boot loop.
+fn resolve_module_dir(name: Option<&str>, index: usize, arch: &str) -> Result<PathBuf> {
+    let modules = eligible_modules(arch);
+
+    if let Some(name) = name {
+        if !valid_module_id(name) {
+            bail!("invalid module id `{name}`");
+        }
+        if let Some((_, dir)) = modules.iter().find(|(n, _)| n == name) {
+            return Ok(dir.clone());
+        }
+        // The staged copy this list pointed at may already have been consumed
+        // by the activation swap; the active directory is then the only one
+        // left, and it is the one the module was streamed from.
+        let active = Path::new(constants::PATH_MODULES_DIR).join(name);
+        if active.is_dir() {
+            return Ok(active);
+        }
+        // FN node, addressed by its id through the same request.
+        if let Some(node) = r#fn::active_native_nodes(TMP_PATH.get().unwrap())
+            .into_iter()
+            .find(|node| node.id == name)
+        {
+            return Ok(node.dir);
+        }
+        bail!("unknown module or FN node `{name}`");
+    }
+
+    // Legacy loader: position in the freshly scanned list, FN nodes offset past
+    // the classic module count.
+    if let Some((_, dir)) = modules.get(index) {
+        return Ok(dir.clone());
+    }
+    let nodes = r#fn::active_native_nodes(TMP_PATH.get().unwrap());
+    let Some(node) = nodes.get(index.saturating_sub(modules.len())) else {
+        bail!("Unknown module index {index}");
+    };
+    Ok(node.dir.clone())
+}
+
 fn handle_get_module_dir(stream: &mut UnixStream) -> Result<()> {
     let index = stream.read_usize()?;
-    let modules = eligible_modules(get_arch()?);
-    let dir = if index < modules.len() {
-        // `module_dir` may be a staged-update directory rather than the
-        // active one — see `eligible_modules`.
-        let (_, module_dir) = &modules[index];
-        fs::File::open(module_dir)?
-    } else {
-        // FN node directory, addressed with the offset index space.
-        let nodes = r#fn::active_native_nodes(TMP_PATH.get().unwrap());
-        let fn_index = index - modules.len();
-        let Some(node) = nodes.get(fn_index) else {
-            bail!("Unknown module index {}", index);
-        };
-        fs::File::open(&node.dir)?
-    };
-    stream.send_fd(dir.as_raw_fd())?;
+    let name = read_optional_module_name(stream);
+    let arch = get_arch()?;
+    let dir = resolve_module_dir(name.as_deref(), index, arch)?;
+    let file = fs::File::open(&dir)
+        .with_context(|| format!("failed to open module directory {}", dir.display()))?;
+    stream.send_fd(file.as_raw_fd())?;
     Ok(())
 }
 

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <lsplt.hpp>
@@ -25,8 +26,14 @@
 
 using namespace std;
 
-ZygiskModule::ZygiskModule(int id, void *handle, void *entry, bool custom)
-    : id(id), handle(handle), custom(custom), entry{entry}, api{}, mod{nullptr} {
+ZygiskModule::ZygiskModule(int id, std::string name, void *handle, void *entry, bool custom)
+    : id(id),
+      name(std::move(name)),
+      handle(handle),
+      custom(custom),
+      entry{entry},
+      api{},
+      mod{nullptr} {
     // Make sure all pointers are null
     memset(&api, 0, sizeof(api));
     api.base.impl = this;
@@ -92,7 +99,7 @@ bool ZygiskModule::valid() const {
 int ZygiskModule::connectCompanion() const { return zygiskd::ConnectCompanion(id); }
 
 /* Zygisksu changed: Use own zygiskd */
-int ZygiskModule::getModuleDir() const { return zygiskd::GetModuleDir(id); }
+int ZygiskModule::getModuleDir() const { return zygiskd::GetModuleDir(id, name.c_str()); }
 
 void ZygiskModule::setOption(zygisk::Option opt) {
     if (g_ctx == nullptr) return;
@@ -339,7 +346,7 @@ void ZygiskContext::run_modules_pre() {
     for (size_t i = 0; i < size; i++) {
         auto &m = ms[i];
         if (LoadedModule lm = LoadModuleFromMemfd(m.memfd)) {
-            modules.emplace_back(i, lm.handle, lm.entry, lm.custom);
+            modules.emplace_back(i, m.name, lm.handle, lm.entry, lm.custom);
         }
     }
 
@@ -358,7 +365,7 @@ void ZygiskContext::run_modules_pre() {
         if (LoadedModule lm = LoadModuleFromMemfd(fn.memfd)) {
             LOGI("loading FN module `%s` into %s (priority %u)", fn.id.c_str(),
                  is_server ? "system_server" : process ? process : "unknown", fn.priority);
-            modules.emplace_back(size + i, lm.handle, lm.entry, lm.custom);
+            modules.emplace_back(size + i, fn.id, lm.handle, lm.entry, lm.custom);
         }
     }
 

@@ -5,6 +5,7 @@
 #include <bitset>
 #include <list>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "api.hpp"
@@ -217,12 +218,16 @@ struct ZygiskModule {
     void clearApi() { memset(&api, 0, sizeof(api)); }
     int getId() const { return id; }
 
-    ZygiskModule(int id, void *handle, void *entry, bool custom);
+    ZygiskModule(int id, std::string name, void *handle, void *entry, bool custom);
 
     static bool RegisterModuleImpl(ApiTable *api, long *module);
 
 private:
     const int id;
+    // Module name (or FN node id), sent with `GetModuleDir` so the daemon can
+    // resolve the directory by identity instead of by a position in a list it
+    // recomputes per request.
+    const std::string name;
     bool unload = false;
 
     void *const handle;

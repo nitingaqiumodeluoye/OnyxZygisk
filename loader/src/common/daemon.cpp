@@ -162,14 +162,23 @@ int ConnectCompanion(size_t index) {
     }
 }
 
-int GetModuleDir(size_t index) {
-    UniqueFd fd = Connect(1);
+int GetModuleDir(size_t index, const char *name) {
+    // Two attempts: the very first fork after a reboot can race the daemon's
+    // listener, and a module that resolves its payload through this fd has no
+    // way to recover on its own — ZygoteLoader treats -1 as fatal.
+    UniqueFd fd = Connect(2);
     if (fd == -1) {
         PLOGE("GetModuleDir");
         return -1;
     }
     socket_utils::write_u8(fd, (uint8_t) SocketAction::GetModuleDir);
     socket_utils::write_usize(fd, index);
+    // The index is only meaningful against the module list this process was
+    // streamed. The daemon recomputes that list per request and `load_modules`
+    // drops entries it could not turn into a memfd, so the two can disagree;
+    // the name pins the request to the module itself. Older daemons read just
+    // the index and ignore the trailing bytes.
+    socket_utils::write_string(fd, name == nullptr ? std::string_view{} : std::string_view{name});
     return socket_utils::recv_fd(fd);
 }
 

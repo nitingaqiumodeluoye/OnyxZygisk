@@ -121,7 +121,7 @@ int UpdateMountNamespace(MountNamespace type);
 
 int ConnectCompanion(size_t index);
 
-int GetModuleDir(size_t index);
+int GetModuleDir(size_t index, const char *name);
 
 void ZygoteRestart();
 
