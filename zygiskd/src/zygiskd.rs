@@ -116,10 +116,13 @@ pub fn main(tmp_path: Option<&str>) -> Result<()> {
 
 /// Handles a single incoming connection from Zygisk.
 fn handle_connection(mut stream: UnixStream, context: Arc<AppContext>) -> Result<()> {
-    let action = stream.read_u8()?;
-    let action = DaemonSocketAction::try_from(action)
-        .with_context(|| format!("Invalid daemon action code: {}", action))?;
-    trace!("New daemon action: {:?}", action);
+    let raw = stream.read_u8()?;
+    let action = DaemonSocketAction::try_from(raw)
+        .with_context(|| format!("Invalid daemon action code: {}", raw))?;
+    // Temporary diagnostic (was trace!): the loader's getModuleDir() requests
+    // arrive without a directory fd, and the raw action byte is the only way
+    // to tell a misdispatched request apart from a lost descriptor.
+    info!("daemon action byte={:#04x} ({:?})", raw, action);
 
     match action {
         // These actions are lightweight and handled synchronously.
@@ -1763,6 +1766,7 @@ fn resolve_module_dir(name: Option<&str>, index: usize, arch: &str) -> Result<Pa
 fn handle_get_module_dir(stream: &mut UnixStream) -> Result<()> {
     let index = stream.read_usize()?;
     let name = read_optional_module_name(stream);
+    info!("GetModuleDir: index={} name={:?}", index, name);
     let arch = get_arch()?;
     let dir = resolve_module_dir(name.as_deref(), index, arch)?;
     let file = fs::File::open(&dir)

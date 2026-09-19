@@ -54,7 +54,7 @@ ssize_t xrecvmsg(int sockfd, struct msghdr* msg, int flags) {
 void* recv_fds(int sockfd, char* cmsgbuf, size_t bufsz, int cnt) {
     // Create a throwaway buffer.
     // It must match the size Rust sends (sizeof(int) = 4 bytes).
-    int dummy_data;
+    int dummy_data = 0;
 
     iovec iov = {
         .iov_base = &dummy_data,
@@ -79,8 +79,14 @@ void* recv_fds(int sockfd, char* cmsgbuf, size_t bufsz, int cnt) {
 
     // --- No headers received ---
     if (cmsg == nullptr) {
-        LOGE("recv_fds: No control headers received. msg_controllen=%zu",
-             (size_t) msg.msg_controllen);
+        // Dump exactly what arrived so a 4-byte payload can be told apart:
+        // 00 00 00 00 = the send_fd() dummy (fd was sent but never arrived),
+        // 00 00 00 10 = GetProcessFlags' flags (the request was misdispatched).
+        unsigned char raw[4] = {0, 0, 0, 0};
+        memcpy(raw, &dummy_data, sizeof(raw) < (size_t) rec ? sizeof(raw)
+                                                            : (size_t) (rec < 0 ? 0 : rec));
+        LOGE("recv_fds: No control headers received. msg_controllen=%zu rec=%zd data=%02x %02x %02x %02x",
+             (size_t) msg.msg_controllen, rec, raw[0], raw[1], raw[2], raw[3]);
         return nullptr;
     }
 
