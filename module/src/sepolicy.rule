@@ -7,7 +7,9 @@ allow zygote zygisk_file sock_file {read write}
 allow system_server zygisk_file sock_file {read write}
 allow system_server zygote unix_stream_socket connectto
 allow system_server {zygote magisk su} fd use
-allow system_server {tmpfs appdomain_tmpfs} file {read open getattr map execute}
+# memfd is sealed against writes but its descriptor is O_RDWR; receiving it
+# still requires write permission for the original descriptor access mode.
+allow system_server {tmpfs appdomain_tmpfs} file {read write open getattr map execute}
 allow system_server adb_data_file dir {read open search getattr}
 allow system_server adb_data_file file {read open getattr map}
 
