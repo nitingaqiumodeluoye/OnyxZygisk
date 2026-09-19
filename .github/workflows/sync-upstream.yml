@@ -46,15 +46,25 @@ jobs:
           ref: master
           # A merge needs real history to find the common ancestor.
           fetch-depth: 0
-          # Must be the PAT here, not the default token: it is the credential
-          # `git push` will reuse, and it is what makes the push trigger CI.
-          token: ${{ secrets.SYNC_PAT }}
+          # persist-credentials: false keeps actions/checkout from installing
+          # its own `http.<url>.extraheader` credential. That header carries
+          # GITHUB_TOKEN and takes precedence over credentials embedded in the
+          # remote URL, so leaving it on makes every push authenticate as
+          # github-actions[bot] and fail with 403 no matter how the PAT itself
+          # is configured. The PAT is wired into the remote below instead.
+          persist-credentials: false
 
       - name: Configure git
+        env:
+          SYNC_PAT: ${{ secrets.SYNC_PAT }}
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # Authenticate as the PAT owner. A push made with the built-in
+          # GITHUB_TOKEN does not start workflow runs, so the PAT is what makes
+          # Verify build the freshly merged tree.
+          git remote set-url origin "https://x-access-token:${SYNC_PAT}@github.com/${GITHUB_REPOSITORY}.git"
 
       - name: Add upstream remote
         run: |
