@@ -1,0 +1,150 @@
+name: Sync upstream
+
+# Keeps this fork's `master` in step with OnyxZygisk/OnyxZygisk, while keeping
+# OUR build setup. Upstream's verify.yml still uses android-actions
+# /setup-android@v3, which aborts on the runner image's cmdline-tools 16.0
+# because Google removed the `tools` SDK package. Letting upstream overwrite our
+# workflow would turn this fork's CI red, so the CI files are restored from our
+# own commit after every merge.
+#
+# The push is done with a Personal Access Token rather than the default
+# GITHUB_TOKEN. GitHub deliberately does not start workflow runs for pushes made
+# with GITHUB_TOKEN, so using it here would sync the code but silently skip the
+# build. The PAT also carries the `workflow` scope that any push touching
+# .github/workflows/ requires.
+#
+# Requires: repository secret SYNC_PAT (see the step named "Push" below).
+
+on:
+  schedule:
+    # 03:00 UTC daily (11:00 Asia/Shanghai). Upstream moves slowly, so daily is
+    # plenty; adjust the cron if you want it tighter or looser.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Merge and report, but do not push'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  # Never let two syncs race on the same branch.
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream master
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: master
+          # A merge needs real history to find the common ancestor.
+          fetch-depth: 0
+          # Must be the PAT here, not the default token: it is the credential
+          # `git push` will reuse, and it is what makes the push trigger CI.
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Configure git
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Add upstream remote
+        run: |
+          set -euo pipefail
+          if ! git remote get-url upstream >/dev/null 2>&1; then
+            git remote add upstream https://github.com/OnyxZygisk/OnyxZygisk.git
+          fi
+          git fetch upstream master --no-tags
+          echo "upstream/master = $(git rev-parse --short upstream/master)"
+
+      - name: Merge upstream and restore our CI files
+        id: merge
+        run: |
+          set -euo pipefail
+
+          protected=".github/workflows/verify.yml
+          .github/workflows/release.yml
+          .github/workflows/sync-upstream.yml"
+
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "Already up to date with upstream/master, nothing to do."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ours_before="$(git rev-parse HEAD)"
+          echo "Merging $(git rev-parse --short upstream/master) into $ours_before"
+
+          # --no-commit so the CI files can be restored before the merge commit
+          # is recorded. Conflicts are expected on verify.yml; anything else is
+          # reported and aborted further down.
+          git merge upstream/master --no-commit --no-ff || true
+
+          # Take our version of every protected file from the pre-merge commit,
+          # which both resolves those conflicts and guarantees upstream can
+          # never replace our build setup.
+          for f in $protected; do
+            if git cat-file -e "${ours_before}:${f}" 2>/dev/null; then
+              git checkout "$ours_before" -- "$f"
+              echo "restored $f"
+            else
+              echo "skip $f (not present in our tree)"
+            fi
+          done
+
+          # Anything still conflicted is a real source conflict and needs a
+          # human; do not push a half-merged tree.
+          if [ -n "$(git ls-files -u)" ]; then
+            echo "::error::Merge conflicts outside the protected CI files:"
+            git ls-files -u | awk '{print "  " $4}' | sort -u | tee -a "$GITHUB_STEP_SUMMARY"
+            git merge --abort
+            exit 1
+          fi
+
+          if git diff --cached --quiet HEAD; then
+            echo "After restoring our CI files there is nothing left to merge."
+            git merge --abort 2>/dev/null || true
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Single-line message on purpose: a literal multi-line string here
+          # would need every line indented past the block scalar, which is easy
+          # to get wrong and silently breaks the YAML.
+          git commit --no-edit \
+            -m "chore: sync upstream master" \
+            -m "Merge OnyxZygisk/OnyxZygisk master. Workflow files are kept from this fork, which carries fixes upstream does not have yet."
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          git log --oneline -1
+
+      - name: Push
+        if: steps.merge.outputs.changed == 'true' && inputs.dry_run != true
+        run: |
+          set -euo pipefail
+          # The PAT from the checkout step is already configured as the
+          # credential, so a plain push is authenticated. Using the PAT rather
+          # than GITHUB_TOKEN is what makes the on:push trigger fire, so Verify
+          # runs against the freshly merged tree.
+          git push origin master
+          echo "Pushed. The Verify workflow should now start." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report
+        if: always()
+        run: |
+          {
+            echo "### Upstream sync"
+            echo ""
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| upstream/master | \`$(git rev-parse --short upstream/master 2>/dev/null || echo n/a)\` |"
+            echo "| changed | \`${{ steps.merge.outputs.changed }}\` |"
+            echo "| dry run | \`${{ inputs.dry_run }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
