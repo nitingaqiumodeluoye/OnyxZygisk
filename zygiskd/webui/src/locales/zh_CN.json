@@ -38,7 +38,7 @@
     "pendingUpdate": "有更新待生效",
     "hotplug": "立即生效",
     "hotplugOff": "已停用",
-    "hotplugNote": "已应用，设备即将重启以完成激活",
+    "hotplugNote": "已应用，系统框架即将重启以完成激活",
     "hotplugToggle": "已热插拔（可拔）"
   },
   "fn": {

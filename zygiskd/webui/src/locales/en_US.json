@@ -38,7 +38,7 @@
     "pendingUpdate": "Update staged, not yet applied",
     "hotplug": "Apply now",
     "hotplugOff": "master off",
-    "hotplugNote": "Applied; the device will now reboot to finish activation",
+    "hotplugNote": "Applied; the system framework will restart to finish activation",
     "hotplugToggle": "Hot-plugged (unplug)"
   },
   "fn": {

@@ -297,8 +297,8 @@ export async function setModuleHotplug(id: string, enabled: boolean): Promise<vo
   );
 
   // Apply immediately through the bundled daemon CLI. It performs the staged
-  // -> active transaction, runs module lifecycle scripts, then reboots the
-  // device once so the module loads at the fresh system_server fork. Both
+  // -> active transaction, runs module lifecycle scripts, then restarts
+  // system_server once so the module loads at the fresh fork. Both
   // ABIs are tried, including a staged OnyxZygisk update whose binary may
   // not have moved into the active directory yet.
   const apply = [

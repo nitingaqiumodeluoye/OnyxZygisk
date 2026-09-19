@@ -887,7 +887,7 @@ fn activate_staged_module(name: &str, module_dir: &Path) {
             let _ = fs::write(activation_marker(&name, "state"), b"1");
             let _ = fs::remove_file(activation_marker(&name, "applying"));
             refresh_controller_info();
-            reboot_device_to_activate(&name, false);
+            restart_system_server_once(&name, false);
         } else {
             // run_pending_staged_services() finishes service + restart later.
             let _ = fs::remove_file(activation_marker(&name, "applying"));
@@ -965,15 +965,15 @@ pub fn apply_hotplug(tmp_path: Option<&str>, name: &str) -> Result<()> {
     // explicit request: the preference may have been changed by the restart
     // guard or safe mode while this marker still says `1`.  That stale-state
     // combination made turning the visible switch back on a no-op.  The
-    // per-system_server PID marker in reboot_device_to_activate provides the
+    // per-system_server PID marker in restart_system_server_once provides the
     // correct idempotency for duplicate bridge deliveries.
     let state_marker = activation_marker(name, "state");
     let target_state = if enabled { "1" } else { "0" };
     fs::write(&state_marker, target_state.as_bytes())?;
 
     refresh_controller_info();
-    if !reboot_device_to_activate(name, true) {
-        bail!("device could not be rebooted to apply the change");
+    if !restart_system_server_once(name, true) {
+        bail!("system_server could not be restarted to apply the change");
     }
     Ok(())
 }
@@ -1143,19 +1143,8 @@ fn resolve_stale_restart_guard() {
     }
 }
 
-/// Circuit breaker for a module that makes system_server crash immediately
-/// after hot-plugging.  The first SystemServerStarted after our intentional
-/// cold reboot (guard stage `rebooting`/`confirming`) begins a stability
-/// window.  A second, different PID inside that window means the framework
-/// restarted again without a user request: unplug the module so the device
-/// can recover on the next (user-initiated) reboot.
-///
-/// NOTE: the old soft-restart path used to SIGKILL system_server here to
-/// force a respawn from the now-unplugged module list.  With the cold-reboot
-/// activation model that is wrong — killing system_server IS a soft restart,
-/// which is exactly what we are trying to avoid.  The unplugged module is
-/// already gone from the active list, so the next ordinary app fork will be
-/// served without it; no kill is needed or safe.
+/// Circuit breaker retained for legacy cold-reboot activation records. The
+/// current hot-plug path restarts only system_server and does not create this guard.
 fn handle_hotplug_restart_guard() {
     let guard = hotplug_restart_guard();
     let Ok(contents) = fs::read_to_string(&guard) else {
@@ -1180,7 +1169,7 @@ fn handle_hotplug_restart_guard() {
     };
 
     if stage == "rebooting" {
-        // Still in the boot that requested the cold reboot.  Do not turn an
+        // Still in the boot that requested the legacy cold reboot. Do not turn an
         // unrelated SystemServerStarted event into a successful activation.
         if recorded_boot == boot_id {
             return;
@@ -1243,20 +1232,10 @@ fn handle_hotplug_restart_guard() {
     }
 }
 
-/// Activate a freshly hot-plugged framework module (LSPosed) by rebooting
-/// the device.  The module must be loaded at the fresh system_server
-/// fork/specialize — the ONLY point a framework module activates — and we
-/// used to get that cheaply by killing system_server (a ~15s framework
-/// "soft reboot").  That proved unsafe: a module that misbehaves on the
-/// soft-restarted framework makes zygote/netd restart repeatedly, and
-/// Android init escalates that into a hard reboot — looping the device.
-/// A full cold reboot re-runs the entire injection chain against a fresh
-/// zygote — the same, well-tested path a module takes after a normal
-/// install — and reliably lands the module in the new system_server.
-///
-/// Guarded by a one-shot marker so it happens once per hot-plug, never on
-/// an ordinary boot (where the module is already active and no swap runs).
-fn reboot_device_to_activate(name: &str, force: bool) -> bool {
+/// Activate a freshly hot-plugged framework module by restarting only
+/// system_server. The module loads at the fresh fork/specialize point;
+/// Android init respawns the framework without rebooting the device.
+fn restart_system_server_once(name: &str, force: bool) -> bool {
     // Serialize marker inspection and PID reservation across the 32/64-bit
     // daemons plus WebUI CLI processes.  The old check-then-kill sequence was
     // racy: several concurrent module scans could all observe a missing marker
@@ -1294,40 +1273,16 @@ fn reboot_device_to_activate(name: &str, force: bool) -> bool {
                 warn!("Hot-plug: failed to reserve system_server restart marker");
                 return false;
             }
-            // Mark the reboot as intentional: resolve_stale_restart_guard
-            // turns this into "confirming" at the next boot, so only a
-            // framework that then fails to stabilize gets the module
-            // unplugged.
-            let Some(boot_id) = current_boot_id() else {
-                let _ = fs::remove_file(&marker);
-                warn!("Hot-plug: kernel boot id is unavailable; refusing an unguarded reboot");
-                return false;
-            };
-            let guard = format!("rebooting:{name}:{boot_id}:{pid}");
-            if fs::write(hotplug_restart_guard(), guard.as_bytes()).is_err() {
-                let _ = fs::remove_file(&marker);
-                warn!("Hot-plug: failed to arm the system_server restart guard");
-                return false;
-            }
             info!(
-                "Hot-plug: rebooting device to activate framework module \"{}\" (system_server pid {})",
+                "Hot-plug: restarting system_server to activate framework module \"{}\" (pid {})",
                 name, pid
             );
-            // Graceful reboot via init (stops services, syncs, unmounts).
-            // Fall back to the toybox reboot binary if the property cannot
-            // be set.
-            if let Err(e) = utils::set_property("sys.powerctl", "reboot") {
-                warn!(
-                    "Hot-plug: sys.powerctl reboot failed ({}); falling back to `reboot`",
-                    e
-                );
-                let _ = Command::new("reboot").status();
-            }
+            unsafe { libc::kill(pid, libc::SIGKILL); }
             true
         }
         None => {
             warn!(
-                "Hot-plug: system_server pid not found; cannot reboot to activate \"{}\"",
+                "Hot-plug: system_server pid not found; cannot restart to activate \"{}\"",
                 name
             );
             false
@@ -1383,10 +1338,10 @@ fn run_pending_staged_services() {
             let _ = fs::write(&marker_clone, b"1");
             let _ = fs::write(activation_marker(&name_clone, "state"), b"1");
             let _ = fs::remove_file(&applying_clone);
-            // Reboot once so this freshly hot-plugged framework module
-            // activates at specialize. See reboot_device_to_activate.
+            // Restart system_server once so this freshly hot-plugged framework module
+            // activates at specialize. See restart_system_server_once.
             refresh_controller_info();
-            reboot_device_to_activate(&name_clone, false);
+            restart_system_server_once(&name_clone, false);
         });
         info!(
             "Hot-plug: scheduling deferred service.sh for swapped module \"{}\"",
