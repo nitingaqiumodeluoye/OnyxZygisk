@@ -556,17 +556,6 @@ void start_live_hotplug_worker() {
 }
 
 void ZygiskContext::server_specialize_pre() {
-    // Retain only the daemon directory, not access to /data/adb (root:0700).
-    // Later socket connects resolve relative to this fd after dropping uid.
-    int live_dir = open(zygiskd::GetTmpPath().c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
-    if (live_dir >= 0 && static_cast<size_t>(live_dir) < allowed_fds.size()) {
-        allowed_fds[live_dir] = true;
-        std::string path = "/proc/self/fd/" + std::to_string(live_dir);
-        zygiskd::Init(path.c_str());
-    } else {
-        if (live_dir >= 0) close(live_dir);
-        LOGE("hot-plug: failed to retain daemon directory");
-    }
     // Notify the daemon BEFORE loading any module. The daemon's hot-plug
     // circuit breaker keys off this heartbeat: if a freshly hot-plugged
     // module crashes or hangs system_server while being loaded below, the
@@ -577,6 +566,8 @@ void ZygiskContext::server_specialize_pre() {
 }
 
 void ZygiskContext::server_specialize_post() {
+    // The live endpoint is outside root-only /data/adb and authenticates UID 1000.
+    zygiskd::Init("/dev/socket/onyxzygisk-live");
     // Capture names before post callbacks may unload module libraries.
     for (const auto &mod : modules) hotplug_loaded.push_back(mod.getName());
     run_modules_post();

@@ -99,6 +99,7 @@ pub fn main(tmp_path: Option<&str>) -> Result<()> {
         fn_companions: Mutex::new(std::collections::HashMap::new()),
     });
     let listener = create_daemon_socket()?;
+    start_live_listener(Arc::clone(&context))?;
 
     info!("Daemon listening on {}", DAEMON_SOCKET_PATH.get().unwrap());
 
@@ -1348,6 +1349,35 @@ fn create_library_fd(so_path: &Path) -> Result<OwnedFd> {
 }
 
 /// Creates and binds the main daemon Unix socket.
+fn start_live_listener(context: Arc<AppContext>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = "/dev/socket/onyxzygisk-live";
+    fs::create_dir_all(dir)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o755))?;
+    utils::chcon(dir, "u:object_r:system_file:s0")?;
+    let path = format!("{}{}", dir, lp_select!("/cp32.sock", "/cp64.sock"));
+    let listener = utils::unix_listener_from_path(&path)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o666))?;
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of_val(&cred) as libc::socklen_t;
+            let result = unsafe {
+                libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED,
+                    &mut cred as *mut _ as *mut libc::c_void, &mut len)
+            };
+            if result != 0 || cred.uid != 1000 {
+                warn!("Hot-plug: rejecting live connection uid={}", cred.uid);
+                continue;
+            }
+            if let Err(e) = handle_connection(stream, Arc::clone(&context)) {
+                warn!("Hot-plug: live connection failed: {}", e);
+            }
+        }
+    });
+    Ok(())
+}
+
 fn create_daemon_socket() -> Result<UnixListener> {
     utils::set_socket_create_context("u:r:zygote:s0")?;
     let listener = utils::unix_listener_from_path(DAEMON_SOCKET_PATH.get().unwrap())?;
