@@ -217,6 +217,7 @@ struct ZygiskModule {
     bool tryUnload() const;
     void clearApi() { memset(&api, 0, sizeof(api)); }
     int getId() const { return id; }
+    const std::string &getName() const { return name; }
 
     ZygiskModule(int id, std::string name, void *handle, void *entry, bool custom);
 
@@ -249,6 +250,8 @@ private:
 
 extern ZygiskContext *g_ctx;
 extern HookContext *g_hook;
+bool live_hotplug_armed();
+void start_live_hotplug_worker();
 extern int (*old_fork)(void);
 
 enum : uint32_t {
@@ -336,6 +339,7 @@ struct HookContext {
     size_t block_size = 0;
     bool should_spoof_maps = false;
     bool should_unmap = false;
+    bool live_hotplug_ready = false;
     bool skip_hooking_unloader = false;
     bool zygote_unmounted = false;
     jint MODIFIER_NATIVE = 0;

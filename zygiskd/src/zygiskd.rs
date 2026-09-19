@@ -380,7 +380,7 @@ fn write_activation_marker(name: &str, suffix: &str) {
 }
 
 fn clear_activation_markers(name: &str) {
-    for suffix in ["post_fs_data", "service", "restarted", "applying", "state"] {
+    for suffix in ["post_fs_data", "service", "restarted", "live_signaled", "applying", "state"] {
         let _ = fs::remove_file(activation_marker(name, suffix));
     }
 }
@@ -887,9 +887,9 @@ fn activate_staged_module(name: &str, module_dir: &Path) {
             let _ = fs::write(activation_marker(&name, "state"), b"1");
             let _ = fs::remove_file(activation_marker(&name, "applying"));
             refresh_controller_info();
-            restart_system_server_once(&name, false);
+            signal_system_server_hotplug(&name, false);
         } else {
-            // run_pending_staged_services() finishes service + restart later.
+            // run_pending_staged_services() finishes service + live loading later.
             let _ = fs::remove_file(activation_marker(&name, "applying"));
         }
     });
@@ -960,20 +960,16 @@ pub fn apply_hotplug(tmp_path: Option<&str>, name: &str) -> Result<()> {
         let _ = fs::remove_file(activation_marker(name, "applying"));
     }
 
-    // The WebUI writes the preference before invoking this CLI.  Persist it
-    // for status/recovery, but do not use the old value to suppress an
-    // explicit request: the preference may have been changed by the restart
-    // guard or safe mode while this marker still says `1`.  That stale-state
-    // combination made turning the visible switch back on a no-op.  The
-    // per-system_server PID marker in restart_system_server_once provides the
-    // correct idempotency for duplicate bridge deliveries.
+    // Persist the preference for status/recovery. New processes pick it up
+    // on their next module scan. The resident live loader deduplicates names;
+    // disabling a module cannot undo hooks in an already-running process.
     let state_marker = activation_marker(name, "state");
     let target_state = if enabled { "1" } else { "0" };
     fs::write(&state_marker, target_state.as_bytes())?;
 
     refresh_controller_info();
-    if !restart_system_server_once(name, true) {
-        bail!("system_server could not be restarted to apply the change");
+    if enabled && !signal_system_server_hotplug(name, true) {
+        bail!("module list updated for new apps; system_server live loading is unavailable");
     }
     Ok(())
 }
@@ -1232,62 +1228,36 @@ fn handle_hotplug_restart_guard() {
     }
 }
 
-/// Activate a freshly hot-plugged framework module by restarting only
-/// system_server. The module loads at the fresh fork/specialize point;
-/// Android init respawns the framework without rebooting the device.
-fn restart_system_server_once(name: &str, force: bool) -> bool {
-    // Serialize marker inspection and PID reservation across the 32/64-bit
-    // daemons plus WebUI CLI processes.  The old check-then-kill sequence was
-    // racy: several concurrent module scans could all observe a missing marker
-    // and kill system_server in succession.
-    let _lock = match acquire_hotplug_lock() {
-        Ok(lock) => lock,
-        Err(e) => {
-            warn!("Hot-plug: failed to lock system_server restart: {}", e);
-            return false;
-        }
-    };
-    let marker = activation_marker(name, "restarted");
-    if marker.exists() && !force {
+/// Ask the resident loader to load newly enabled modules without killing any
+/// process. Never signal an old loader without a registered handler.
+fn signal_system_server_hotplug(name: &str, force: bool) -> bool {
+    if !system_server_ready() {
+        warn!("Hot-plug: framework not ready; live load deferred for {}", name);
+        return false;
+    }
+    let Ok(_lock) = acquire_hotplug_lock() else { return false };
+    let Some(pid) = pidof_system_server() else { return false };
+    let marker = activation_marker(name, "live_signaled");
+    if !force && fs::read_to_string(&marker).ok().as_deref() == Some(&pid.to_string()) {
         return true;
     }
-    match pidof_system_server() {
-        Some(pid) => {
-            // Reserve this exact system_server generation before triggering
-            // the reboot.  A duplicate explicit request racing with us sees
-            // the same PID in the marker and becomes a no-op.  A later
-            // legitimate state transition sees a different PID and may
-            // reboot once.
-            if fs::read_to_string(&marker)
-                .ok()
-                .and_then(|value| value.trim().parse::<i32>().ok())
-                == Some(pid)
-            {
-                info!(
-                    "Hot-plug: system_server pid {} was already reserved for restart",
-                    pid
-                );
-                return true;
-            }
-            if fs::write(&marker, pid.to_string().as_bytes()).is_err() {
-                warn!("Hot-plug: failed to reserve system_server restart marker");
-                return false;
-            }
-            info!(
-                "Hot-plug: restarting system_server to activate framework module \"{}\" (pid {})",
-                name, pid
-            );
-            unsafe { libc::kill(pid, libc::SIGKILL); }
-            true
-        }
-        None => {
-            warn!(
-                "Hot-plug: system_server pid not found; cannot restart to activate \"{}\"",
-                name
-            );
-            false
-        }
+    let caught = fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|s| s.lines().find_map(|line| line.strip_prefix("SigCgt:").map(str::trim).map(str::to_owned)))
+        .and_then(|s| u64::from_str_radix(&s, 16).ok())
+        .unwrap_or(0);
+    const HOTPLUG_SIGNAL: i32 = 40;
+    if caught & (1u64 << (HOTPLUG_SIGNAL - 1)) == 0 {
+        warn!("Hot-plug: no live loader handler in system_server {}; new apps still use the updated module list", pid);
+        return false;
     }
+    if unsafe { libc::kill(pid, HOTPLUG_SIGNAL) } != 0 {
+        warn!("Hot-plug: live load signal failed: {}", Error::last_os_error());
+        return false;
+    }
+    let _ = fs::write(marker, pid.to_string());
+    info!("Hot-plug: requested live load for {} in system_server {} without restart", name, pid);
+    true
 }
 
 fn run_pending_staged_services() {
@@ -1338,10 +1308,10 @@ fn run_pending_staged_services() {
             let _ = fs::write(&marker_clone, b"1");
             let _ = fs::write(activation_marker(&name_clone, "state"), b"1");
             let _ = fs::remove_file(&applying_clone);
-            // Restart system_server once so this freshly hot-plugged framework module
-            // activates at specialize. See restart_system_server_once.
+            // Ask the live loader to activate the newly staged module.
+            // Existing modules in system_server are retained until process exit.
             refresh_controller_info();
-            restart_system_server_once(&name_clone, false);
+            signal_system_server_hotplug(&name_clone, false);
         });
         info!(
             "Hot-plug: scheduling deferred service.sh for swapped module \"{}\"",

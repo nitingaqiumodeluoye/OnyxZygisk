@@ -10,6 +10,10 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <csignal>
+#include <cerrno>
+#include <poll.h>
 #include <string>
 #include <utility>
 #include <vector>
@@ -457,17 +461,99 @@ void ZygiskContext::app_specialize_post() {
     env->ReleaseStringUTFChars(args.app->nice_name, process);
 }
 
-// Live injection into an already-running system_server was tried (a worker
-// thread pulling modules and calling preServerSpecialize) and is a dead end:
-// device logs proved it deterministically SIGSEGVs system_server the instant
-// the load runs. A framework module (LSPosed) only activates when it is loaded
-// at system_server's *fork/specialize* — never mid-life. Re-forking
-// system_server in place (kill + respawn) was tried next and proved unsafe:
-// a module that misbehaves on the soft-restarted framework makes zygote/netd
-// restart repeatedly, which Android init escalates into a hard reboot —
-// looping the device. So a module hot-plugged after boot is activated by
-// rebooting the device once; the daemon does that after swapping the module
-// into the active directory. See zygiskd::reboot_device_to_activate.
+// Experimental post-boot live loading, based on d1763cd. Keep only durable
+// process state: the specialization context and its JNIEnv are stack/thread local.
+static constexpr int kHotplugSignal = 40;
+static int hotplug_pipe[2] = {-1, -1};
+static JavaVM *hotplug_vm = nullptr;
+static std::vector<std::string> hotplug_loaded;
+static uint32_t hotplug_flags = 0;
+static std::atomic<bool> hotplug_worker_started{false};
+
+bool live_hotplug_armed() { return hotplug_pipe[0] >= 0; }
+
+static void hotplug_signal_handler(int) {
+    const int saved_errno = errno;
+    const char request = 1;
+    // Nonblocking async-signal-safe wakeup. A full pipe already has work queued.
+    (void) write(hotplug_pipe[1], &request, sizeof(request));
+    errno = saved_errno;
+}
+
+static void *hotplug_worker(void *) {
+    JNIEnv *env = nullptr;
+    if (hotplug_vm->AttachCurrentThreadAsDaemon(&env, nullptr) != JNI_OK) {
+        LOGE("hot-plug: could not attach live loader worker to JVM");
+        return nullptr;
+    }
+    // Owned for process life, never the old specialization stack object.
+    auto *ctx = new ZygiskContext(env, nullptr);
+    ctx->info_flags = hotplug_flags;
+    ctx->flags = SERVER_FORK_AND_SPECIALIZE;
+    g_ctx = nullptr;
+    LOGI("hot-plug: live loader worker ready (pid %d)", getpid());
+    for (;;) {
+        pollfd wake{hotplug_pipe[0], POLLIN, 0};
+        if (poll(&wake, 1, -1) < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        char requests[64];
+        if (read(hotplug_pipe[0], requests, sizeof(requests)) <= 0) continue;
+        auto ms = zygiskd::ReadModules();
+        for (size_t i = 0; i < ms.size(); ++i) {
+            auto &m = ms[i];
+            if (std::find(hotplug_loaded.begin(), hotplug_loaded.end(), m.name) != hotplug_loaded.end()) continue;
+            LOGI("hot-plug: live load begin module=%s pid=%d", m.name.c_str(), getpid());
+            auto lm = LoadModuleFromMemfd(m.memfd);
+            if (!lm) continue;
+            ctx->modules.emplace_back(static_cast<int>(i), m.name, lm.handle, lm.entry, lm.custom);
+            auto &mod = ctx->modules.back();
+            jint uid = 1000, gid = 1000, runtime_flags = 0;
+            jintArray gids = nullptr;
+            jlong permitted = 0, effective = 0;
+            ServerSpecializeArgs_v1 args(uid, gid, gids, runtime_flags, permitted, effective);
+            ctx->args.server = &args;
+            ctx->flags = SERVER_FORK_AND_SPECIALIZE;
+            g_ctx = ctx;
+            mod.onLoad(env);
+            if (mod.valid() && !env->ExceptionCheck()) {
+                LOGI("hot-plug: preServerSpecialize module=%s", m.name.c_str());
+                mod.preServerSpecialize(&args);
+                if (!env->ExceptionCheck()) {
+                    ctx->flags |= POST_SPECIALIZE;
+                    mod.postServerSpecialize(&args);
+                }
+            }
+            if (env->ExceptionCheck()) {
+                LOGE("hot-plug: Java exception module=%s", m.name.c_str());
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+            mod.clearApi();
+            mod.tryUnload();
+            ctx->args.ptr = nullptr;
+            g_ctx = nullptr;
+            // Never run initialization twice for a resident library, even on error.
+            hotplug_loaded.push_back(m.name);
+            LOGI("hot-plug: live load end module=%s", m.name.c_str());
+        }
+    }
+    hotplug_vm->DetachCurrentThread();
+    return nullptr;
+}
+
+void start_live_hotplug_worker() {
+    if (hotplug_worker_started.exchange(true)) return;
+    pthread_t worker;
+    const int error = pthread_create(&worker, nullptr, hotplug_worker, nullptr);
+    if (error != 0) {
+        hotplug_worker_started.store(false);
+        LOGE("hot-plug: worker creation failed: %d", error);
+        return;
+    }
+    pthread_detach(worker);
+}
 
 void ZygiskContext::server_specialize_pre() {
     // Notify the daemon BEFORE loading any module. The daemon's hot-plug
@@ -479,7 +565,31 @@ void ZygiskContext::server_specialize_pre() {
     run_modules_pre();
 }
 
-void ZygiskContext::server_specialize_post() { run_modules_post(); }
+void ZygiskContext::server_specialize_post() {
+    // Capture names before post callbacks may unload module libraries.
+    for (const auto &mod : modules) hotplug_loaded.push_back(mod.getName());
+    run_modules_post();
+    if (env->GetJavaVM(&hotplug_vm) != JNI_OK) return;
+    hotplug_flags = info_flags;
+    struct sigaction previous {};
+    if (sigaction(kHotplugSignal, nullptr, &previous) != 0 || previous.sa_handler != SIG_DFL) {
+        LOGW("hot-plug: signal 40 is already owned; live loading unavailable");
+        return;
+    }
+    if (pipe2(hotplug_pipe, O_CLOEXEC | O_NONBLOCK) != 0) return;
+    struct sigaction action {};
+    action.sa_handler = hotplug_signal_handler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESTART;
+    if (sigaction(kHotplugSignal, &action, nullptr) != 0) {
+        close(hotplug_pipe[0]);
+        close(hotplug_pipe[1]);
+        hotplug_pipe[0] = hotplug_pipe[1] = -1;
+        return;
+    }
+    // No thread is created here: setcon must complete single-threaded.
+    LOGI("hot-plug: armed live loader signal in system_server (pid %d)", getpid());
+}
 
 // -----------------------------------------------------------------
 

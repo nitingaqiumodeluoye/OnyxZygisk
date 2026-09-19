@@ -22,10 +22,7 @@ async function toggleHotplug(m: ModuleInfo, enabled: boolean) {
   msg.value = "";
   try {
     await setModuleHotplug(m.id, enabled);
-    // The daemon CLI safely moves a staged module into the active directory,
-    // finishes its lifecycle scripts, and restarts system_server once so the
-    // module loads at the fresh system_server fork. The manager/WebView
-    // remains available while the framework restarts.
+    // The daemon applies the module list and requests live loading without restarting.
     msg.value = t("modules.hotplugNote");
     await load();
   } catch (e) {

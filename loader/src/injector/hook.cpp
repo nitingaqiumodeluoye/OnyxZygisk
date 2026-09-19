@@ -252,6 +252,12 @@ static void new_reopen_or_detach(const void *object, void *fail_fn) {
 DCL_HOOK_FUNC(static int, pthread_attr_setstacksize, void *target, size_t size) {
     int res = old_pthread_attr_setstacksize((pthread_attr_t *) target, size);
 
+    // Specialization and setcon have finished once the stack context is gone.
+    // Start from normal execution, never from the signal handler.
+    if (g_hook->live_hotplug_ready && gettid() == getpid()) {
+        start_live_hotplug_worker();
+    }
+
     if (g_hook->should_unmap && gettid() == getpid()) {
         // Only perform unloading on the main thread
 
@@ -314,6 +320,11 @@ ZygiskContext::~ZygiskContext() {
     // Cleanup
     g_hook->should_unmap = true;
     g_hook->restore_zygote_hook(env);
+    if ((flags & SERVER_FORK_AND_SPECIALIZE) && live_hotplug_armed()) {
+        // The signal handler and worker live in this mapping for process life.
+        g_hook->should_unmap = false;
+        g_hook->live_hotplug_ready = true;
+    }
 }
 
 // -----------------------------------------------------------------

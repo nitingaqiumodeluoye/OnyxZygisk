@@ -38,7 +38,7 @@
     "pendingUpdate": "Update staged, not yet applied",
     "hotplug": "Apply now",
     "hotplugOff": "master off",
-    "hotplugNote": "Applied; the system framework will restart to finish activation",
+    "hotplugNote": "Applied without restart. New apps use the updated module list; running processes retain loaded modules.",
     "hotplugToggle": "Hot-plugged (unplug)"
   },
   "fn": {
