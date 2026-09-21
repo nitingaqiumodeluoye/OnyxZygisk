@@ -22,3 +22,7 @@ zygiskd/webui/dist/
 .zcode/
 gradle/gradle-daemon-jvm.properties
 .claude/
+
+# Local scratch directory: CI artifacts, device-side diagnostic scripts and
+# screenshots. Never intended to be committed.
+.ci/

@@ -190,7 +190,10 @@ export class Cli {
 			"for f in /data/adb/ksu/log/logcat.log /data/adb/ksu/log/logcat.old.log; do",
 			'  [ -r "$f" ] || continue',
 			'  tail -n "$read" "$f" 2>/dev/null | grep -E "zygiskd|zygisk-sh" | grep -E "$pat" | tail -n "$n"',
-			"  exit 0",
+			// `break`, not `exit 0`: exiting would kill the shared root shell.
+			// Leaving the loop after the first readable file is the same intent,
+			// and the trailing `:` below still yields status 0.
+			"  break",
 			"done",
 			":",
 		].join("\n");
@@ -252,8 +255,15 @@ export class Cli {
 				"; do",
 			'  [ -x "$b" ] && { bin="$b"; break; }',
 			"done",
-			'[ -n "$bin" ] || { echo "OnyxZygisk daemon binary not found"; exit 127; }',
-			`"$bin" hotplug ${shellQuote(id)} --workdir ${shellQuote(WORKDIR)}`,
+			'if [ -n "$bin" ]; then',
+			`  "$bin" hotplug ${shellQuote(id)} --workdir ${shellQuote(WORKDIR)}`,
+			"else",
+			'  echo "OnyxZygisk daemon binary not found"',
+			// Subshell exit again: 127 has to reach the caller, but a bare exit
+			// would take the shared root shell down with it. This also stops the
+			// script from running hotplug with an empty $bin.
+			"  (exit 127)",
+			"fi",
 		].join("\n");
 		await this.#runChecked(apply, "apply hot-plug module");
 	}
@@ -312,7 +322,13 @@ export class Cli {
 			'} 2>&1)"',
 			"rc=$?",
 			'printf "%s" "$out" | base64',
-			'exit "$rc"',
+			// A subshell, not a bare `exit`. APatch and Aster serve every exec from a
+			// single persistent root shell (libsu's shared Shell instance), so a
+			// bare exit here terminates the shell the *next* command needs and
+			// turns it into errno -1 — the whole panel then reads as one error. The
+			// subshell still becomes this script's status, so callers keep seeing
+			// the real exit code.
+			'(exit "$rc")',
 		].join("\n");
 		const result = await getBridge().exec(wrapped);
 		return {
