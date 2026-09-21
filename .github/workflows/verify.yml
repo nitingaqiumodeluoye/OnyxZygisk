@@ -93,14 +93,18 @@ jobs:
     needs: changes
     if: needs.changes.outputs.webui == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The React stack adds a Playwright end-to-end suite, which downloads a
+    # browser and boots a server before any spec runs.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: pnpm/action-setup@v6
         with:
-          version: 11.17.0
+          # Pinned by package.json's packageManager field; a mismatch makes
+          # `pnpm install --frozen-lockfile` fail rather than drift.
+          version: 11.25.0
       - uses: actions/setup-node@v7
         with:
           node-version: 24
@@ -109,15 +113,29 @@ jobs:
       - name: Install dependencies
         working-directory: zygiskd/webui
         run: pnpm install --frozen-lockfile
-      - name: Typecheck
+      # `biome ci`, not `pnpm lint`: the lint script is `biome check --write`,
+      # which rewrites files. A check job must never mutate the tree it is
+      # gating, so the read-only form is what belongs here.
+      - name: Format and lint
         working-directory: zygiskd/webui
-        run: pnpm typecheck
-      - name: Unit tests
+        run: pnpm check:biome
+      - name: Type-check
+        working-directory: zygiskd/webui
+        run: pnpm type-check
+      # The unit guards scan the real build output (the emitted stylesheet and
+      # scripts), so they need a build first.
+      - name: Build
+        working-directory: zygiskd/webui
+        run: pnpm build
+      - name: Unit guards
         working-directory: zygiskd/webui
         run: pnpm test
-      - name: Lint
+      - name: Install Playwright browsers
         working-directory: zygiskd/webui
-        run: pnpm lint
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Behaviour and accessibility
+        working-directory: zygiskd/webui
+        run: pnpm test:e2e
 
   android:
     name: Android release package
@@ -173,6 +191,10 @@ jobs:
             cargo-${{ runner.os }}-
       # Prebuilt binary instead of `cargo install`, which would compile
       # cargo-ndk from source (~1.5-3 min) on every single run.
+      #
+      # The download is retried: the release CDN intermittently answers 504,
+      # and without a retry that single hiccup fails the android job, which is
+      # the most expensive job to re-run.
       - name: Install cargo-ndk (prebuilt)
         run: |
           set -euo pipefail
@@ -180,8 +202,18 @@ jobs:
           TRIPLE=x86_64-unknown-linux-gnu
           ARCHIVE="cargo-ndk-${TRIPLE}-v${VERSION}.tgz"
           SHA256=9451622c4567e8abb2c8005001855e32901c0b716ccdd3a173a4375fd03426e1
-          curl -fsSL -o "/tmp/${ARCHIVE}" \
-            "https://github.com/bbqsrc/cargo-ndk/releases/download/v${VERSION}/${ARCHIVE}"
+          URL="https://github.com/bbqsrc/cargo-ndk/releases/download/v${VERSION}/${ARCHIVE}"
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "/tmp/${ARCHIVE}" "$URL"; then
+              break
+            fi
+            if [ "$attempt" = 5 ]; then
+              echo "::error::Failed to download cargo-ndk after $attempt attempts"
+              exit 1
+            fi
+            echo "cargo-ndk download attempt $attempt failed, retrying in $((attempt * 5))s"
+            sleep $((attempt * 5))
+          done
           echo "${SHA256}  /tmp/${ARCHIVE}" | sha256sum -c -
           tar -xzf "/tmp/${ARCHIVE}" -C /tmp
           install -m 0755 "/tmp/cargo-ndk-${TRIPLE}-v${VERSION}/cargo-ndk" "${CARGO_HOME:-$HOME/.cargo}/bin/cargo-ndk"
@@ -190,7 +222,9 @@ jobs:
           cargo ndk --version
       - uses: pnpm/action-setup@v6
         with:
-          version: 11.17.0
+          # Same pin as the webui job: package.json's packageManager field
+          # is what pnpm actually enforces during the Gradle-driven build.
+          version: 11.25.0
       - uses: actions/setup-node@v7
         with:
           node-version: 24
