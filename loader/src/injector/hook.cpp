@@ -182,6 +182,27 @@ DCL_HOOK_FUNC(int, property_get, const char *key, char *value, const char *defau
 using ReopenOrDetachFn = void (*)(const void *, void *);
 static ReopenOrDetachFn old_reopen_or_detach = nullptr;
 
+// `FileDescriptorInfo::ReopenOrDetach()` is an internal AOSP symbol, so no stable ABI covers it
+// and both its signature and its mangled name changed over time:
+//   * Android 8-11: `bool ReopenOrDetach() const`            -> ...14ReopenOrDetachEv
+//   * Android 12+ : `void ReopenOrDetach(fail_fn_t) const`   -> ...14ReopenOrDetachERKNSt3__18functionI...
+// The spelling previously registered here, `_ZNK18FileDescriptorInfo14ReopenOrDetach`, carried no
+// argument encoding at all, so it could not resolve on any release.
+//
+// Register both spellings to cover the whole supported range. Each needs its own backup slot:
+// lsplt::CommitHook() leaves the backup of an unresolved symbol untouched, so a shared pointer
+// would already be non-null when the cleanup below tests it, keeping the dead entry in plt_backup.
+// restore_plt_hook() would then fail to unhook it and clear `should_unmap`, silently disabling
+// Zygisk's own unmapping.
+using ReopenOrDetachLegacyFn = bool (*)(const void *);
+static ReopenOrDetachLegacyFn old_reopen_or_detach_legacy = nullptr;
+
+static constexpr const char *kReopenOrDetachSym =
+    "_ZNK18FileDescriptorInfo14ReopenOrDetachERKNSt3__18functionIFvNS0_12basic_stringIcNS0_11char_"
+    "traitsIcEENS0_9allocatorIcEEEEEEE";
+static constexpr const char *kReopenOrDetachSymLegacy =
+    "_ZNK18FileDescriptorInfo14ReopenOrDetachEv";
+
 // Opaque mirror of Android's internal FileDescriptorInfo. This is deliberately
 // best-effort because the type is not part of the stable NDK ABI.
 struct FileDescriptorInfoLayout {
@@ -223,27 +244,50 @@ static bool read_file_descriptor_info(const void *object, int &fd, const char *&
     return fd >= 0 && path != nullptr;
 }
 
-static void new_reopen_or_detach(const void *object, void *fail_fn) {
-    if (old_reopen_or_detach == nullptr) return;
-
+// True when the descriptor must be detached because the file zygote opened it from no longer
+// exists, which happens for root-module overlay files unmounted after the FD was created. The
+// descriptor to close is reported through |fd_out|.
+static bool is_stale_zygote_descriptor(const void *object, int &fd_out) {
     int fd = -1;
     const char *path = nullptr;
     bool is_sock = false;
-    if (!read_file_descriptor_info(object, fd, path, is_sock)) {
-        old_reopen_or_detach(object, fail_fn);
-        return;
-    }
+    if (!read_file_descriptor_info(object, fd, path, is_sock)) return false;
 
     constexpr std::string_view boot_image = "/memfd:/boot-image-methods.art";
     if (is_sock || std::string_view(path).starts_with(boot_image) || access(path, F_OK) == 0) {
-        old_reopen_or_detach(object, fail_fn);
-        return;
+        return false;
     }
 
     // A root-module overlay may have disappeared after zygote opened the FD.
     // Detach that stale descriptor instead of invoking the framework abort path.
     LOGV("detaching unavailable zygote file descriptor %d (%s)", fd, path);
-    close(fd);
+    fd_out = fd;
+    return true;
+}
+
+// Android 12+: failure is reported by invoking fail_fn.
+static void new_reopen_or_detach(const void *object, void *fail_fn) {
+    if (old_reopen_or_detach == nullptr) return;
+
+    int fd = -1;
+    if (is_stale_zygote_descriptor(object, fd)) {
+        close(fd);
+        return;
+    }
+    old_reopen_or_detach(object, fail_fn);
+}
+
+// Android 8-11: failure is reported by returning false, so a detached descriptor has to report
+// success instead. Only registered together with the legacy spelling that it belongs to.
+static bool new_reopen_or_detach_legacy(const void *object) {
+    if (old_reopen_or_detach_legacy == nullptr) return true;
+
+    int fd = -1;
+    if (is_stale_zygote_descriptor(object, fd)) {
+        close(fd);
+        return true;
+    }
+    return old_reopen_or_detach_legacy(object);
 }
 
 // We cannot directly call `munmap` to unload ourselves, otherwise when `munmap` returns,
@@ -387,17 +431,37 @@ void HookContext::hook_plt() {
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, strdup);
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, property_get);
     if (android_runtime_dev != 0 && android_runtime_inode != 0) {
-        register_hook(android_runtime_dev, android_runtime_inode,
-                      "_ZNK18FileDescriptorInfo14ReopenOrDetach",
+        register_hook(android_runtime_dev, android_runtime_inode, kReopenOrDetachSym,
                       reinterpret_cast<void *>(new_reopen_or_detach),
                       reinterpret_cast<void **>(&old_reopen_or_detach));
+        register_hook(android_runtime_dev, android_runtime_inode, kReopenOrDetachSymLegacy,
+                      reinterpret_cast<void *>(new_reopen_or_detach_legacy),
+                      reinterpret_cast<void **>(&old_reopen_or_detach_legacy));
     }
     // Hook read() in libc.so so any library that reads /proc/<pid>/status
     // (including detection apps using libc directly) gets a sanitized
     // TracerPid line.  See sanitize_tracer_pid_in_buffer.
     PLT_HOOK_REGISTER(libc_dev, libc_inode, read);
 
-    if (!lsplt::CommitHook(cached_map_infos)) LOGE("HookContext::hook_plt failed");
+    // lsplt::CommitHook() fails as soon as a single registered symbol cannot be resolved, so a
+    // missing *optional* hook must not be reported as a bootstrap failure. Its documentation
+    // points at the backup pointers as the way to tell which symbol actually landed; the
+    // bootstrap hooks registered above are mandatory, the rest are best-effort.
+    if (!lsplt::CommitHook(cached_map_infos)) {
+        if (old_fork == nullptr || old_unshare == nullptr || old_strdup == nullptr ||
+            old_property_get == nullptr) {
+            LOGE("HookContext::hook_plt failed: bootstrap hook missing "
+                 "(fork=%p unshare=%p strdup=%p property_get=%p)",
+                 reinterpret_cast<void *>(old_fork), reinterpret_cast<void *>(old_unshare),
+                 reinterpret_cast<void *>(old_strdup), reinterpret_cast<void *>(old_property_get));
+        } else {
+            LOGW("HookContext::hook_plt: best-effort hook missing "
+                 "(reopen_or_detach=%p reopen_or_detach_legacy=%p read=%p)",
+                 reinterpret_cast<void *>(old_reopen_or_detach),
+                 reinterpret_cast<void *>(old_reopen_or_detach_legacy),
+                 reinterpret_cast<void *>(old_read));
+        }
+    }
 
     // Remove unhooked methods
     plt_backup.erase(std::remove_if(plt_backup.begin(), plt_backup.end(),
