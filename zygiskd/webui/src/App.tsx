@@ -189,7 +189,13 @@ export function App(): React.JSX.Element {
 				}
 			/>
 
-			<main className="flex-1 pb-6">
+			<main
+				className="flex-1 pb-6"
+				style={{
+					paddingBottom:
+						"calc(var(--onx-nav-height) + var(--onx-bottom-inset) + 24px)",
+				}}
+			>
 				{page === 0 ? <StatusView snapshot={snapshot} /> : null}
 				{page === 1 ? (
 					<ModulesView

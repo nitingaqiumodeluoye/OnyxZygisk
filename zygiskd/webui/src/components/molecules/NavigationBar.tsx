@@ -35,7 +35,7 @@ export function NavigationBar({
 			aria-label={label}
 			style={{ paddingBottom: "var(--onx-bottom-inset)" }}
 			className={cx(
-				"sticky bottom-0 z-10 border-t border-onx-divider bg-onx-surface",
+				"fixed inset-x-0 bottom-0 z-10 border-t border-onx-divider bg-onx-surface",
 				className,
 			)}
 		>
