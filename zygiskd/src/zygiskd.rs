@@ -1128,6 +1128,92 @@ fn parse_daemon_nice_name(script: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+/// How long a single `/proc/<pid>/cmdline` read may take before we give up on
+/// it and stop asking that process for its command line.
+const CMDLINE_READ_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// `(pid, starttime)` pairs whose `cmdline` read has already timed out.
+///
+/// A wedged process never answers, so without this every scan would leak one
+/// more blocked worker thread. Keyed on starttime as well so that a recycled
+/// pid is not wrongly skipped.
+fn unreadable_cmdlines() -> &'static Mutex<std::collections::HashSet<(i32, u64)>> {
+    static UNREADABLE: OnceLock<Mutex<std::collections::HashSet<(i32, u64)>>> = OnceLock::new();
+    UNREADABLE.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// `(comm, state, starttime)` from `/proc/<pid>/stat`. All three are plain
+/// `task_struct` fields, so unlike `cmdline` this cannot block.
+fn proc_stat(pid: i32) -> Option<(String, u8, u64)> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `<pid> (<comm>) <state> ...` -- comm may contain spaces and parens, so
+    // take everything between the first '(' and the last ')'.
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    let comm = stat[open + 1..close].to_string();
+    let mut fields = stat[close + 1..].split_ascii_whitespace();
+    let state = *fields.next()?.as_bytes().first()?;
+    // starttime is the 20th field after `comm`, i.e. the 19th remaining one.
+    let starttime: u64 = fields.nth(18)?.parse().ok()?;
+    Some((comm, state, starttime))
+}
+
+/// Read `/proc/<pid>/cmdline`, or `None` when it cannot be read *safely*.
+///
+/// `/proc/<pid>/cmdline` is not a harmless read: it takes `mmap_read_lock` on
+/// the *target's* mm. A process that is wedged while holding that lock for
+/// write makes the read spin inside the kernel and never return. That is not
+/// hypothetical: on 2026-10-11 a MiChargeBypass supervisor doing
+/// `cat /proc/<pid>/cmdline | tr -d ...` hung for 30+ minutes on a recycled
+/// pid, burning a full CPU core, and because its `$(...)` never saw EOF its
+/// whole inspection loop silently deadlocked.
+///
+/// Two defences, cheapest first:
+///   1. skip process states that can never be a live daemon we look for and
+///      that may be holding that lock (D, Z, X, T, I, W)
+///   2. still read everything else on a worker thread with a timeout, and
+///      remember the pids that time out
+///
+/// A caller must read `None` as "not detected", not as proof the process is
+/// gone: a process in one of the states skipped above (or one that times out)
+/// is reported the same way.
+fn safe_cmdline(pid: i32) -> Option<Vec<u8>> {
+    let (_, state, starttime) = proc_stat(pid)?;
+    if matches!(state, b'D' | b'Z' | b'X' | b'x' | b'T' | b't' | b'I' | b'W') {
+        return None;
+    }
+    if unreadable_cmdlines()
+        .lock()
+        .ok()?
+        .contains(&(pid, starttime))
+    {
+        return None;
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Dropping the handle detaches the worker: if it is stuck it stays stuck
+    // and is never joined -- which is the point. Bounded by the memo above.
+    thread::Builder::new()
+        .name(format!("cmdline{pid}"))
+        .spawn(move || {
+            let _ = tx.send(fs::read(format!("/proc/{pid}/cmdline")).ok());
+        })
+        .ok()?;
+    match rx.recv_timeout(CMDLINE_READ_TIMEOUT) {
+        Ok(data) => data.filter(|data| !data.is_empty()),
+        Err(_) => {
+            warn!(
+                "Reading /proc/{pid}/cmdline did not return within {CMDLINE_READ_TIMEOUT:?}; \
+                 ignoring that pid from now on"
+            );
+            if let Ok(mut set) = unreadable_cmdlines().lock() {
+                set.insert((pid, starttime));
+            }
+            None
+        }
+    }
+}
+
 fn process_cmdline_matches<F>(mut pred: F) -> bool
 where
     F: FnMut(&[String]) -> bool,
@@ -1136,15 +1222,12 @@ where
         return false;
     };
     for entry in dir.flatten() {
-        if entry.file_name().to_string_lossy().parse::<i32>().is_err() {
-            continue;
-        }
-        let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
             continue;
         };
-        if cmdline.is_empty() {
+        let Some(cmdline) = safe_cmdline(pid) else {
             continue;
-        }
+        };
         let args: Vec<String> = cmdline
             .split(|b| *b == 0)
             .filter(|s| !s.is_empty())
@@ -1508,13 +1591,20 @@ fn opted_in_staged_modules() -> Vec<(String, PathBuf)> {
 /// marker checks, and each module is scheduled for real work at most once
 /// (guarded by the marker file itself).
 /// The pid of the running `system_server`, found by scanning `/proc`.
+///
+/// Matched on `/proc/<pid>/comm` instead of `cmdline`: comm is a plain
+/// `task_struct` field, while reading `cmdline` can wedge the reader (see
+/// `safe_cmdline`). For the real system_server both are `system_server`, and
+/// comm is cheaper -- this runs on every module scan. Zombies are skipped
+/// explicitly, since a dead system_server is still named `system_server`
+/// (whose cmdline used to read as empty).
 fn pidof_system_server() -> Option<i32> {
     for entry in fs::read_dir("/proc").ok()?.flatten() {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
             continue;
         };
-        if let Ok(cmdline) = fs::read_to_string(format!("/proc/{pid}/cmdline")) {
-            if cmdline.split('\0').next() == Some("system_server") {
+        if let Some((comm, state, _)) = proc_stat(pid) {
+            if comm == "system_server" && state != b'Z' {
                 return Some(pid);
             }
         }
