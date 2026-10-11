@@ -45,13 +45,14 @@ export function ModulesView({
 		setBusyId(module.id);
 		try {
 			await cli.setModuleHotplug(module.id, enabled);
-			// The daemon CLI safely moves a staged module into the active
-			// directory, finishes its lifecycle scripts, and reboots the device
-			// once so the module loads at the fresh system_server fork.
+			// Ordinary modules are live-loaded into the running framework;
+			// framework modules (Vector/LSPosed) cannot, so the daemon restarts
+			// the framework once and starts their daemon against the fresh
+			// system_server.
 			onNotify(
 				tr(
 					"modules_hotplug_applied",
-					"Applied. The device will reboot to finish activation.",
+					"Applied. Framework modules (Vector/LSPosed) restart the framework to activate.",
 				),
 				"normal",
 			);

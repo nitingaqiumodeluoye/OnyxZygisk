@@ -137,7 +137,9 @@ test.describe("modules", () => {
 			.getByRole("switch", { name: "Apply the staged update now" })
 			.click();
 		await expect(
-			page.getByText("Applied. The device will reboot to finish activation."),
+			page.getByText(
+				"Applied. Framework modules (Vector/LSPosed) restart the framework to activate.",
+			),
 		).toBeVisible();
 	});
 });
