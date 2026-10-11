@@ -26,7 +26,7 @@ Works out of the box on **APatch**, **KernelSU** (including LKM late-load), and 
 
 ### Zero-reboot workflow
 
-- **Hot-plug** — enable or disable Zygisk modules without rebooting.
+- **Hot-plug** — enable or disable Zygisk modules without rebooting. Framework modules (Vector, LSPosed) are the exception: their payload must be present at the moment `system_server` is forked, so a hot-plug restarts the framework once instead of live-loading.
 - **FN modules** — declarative, scoped, hot-swappable extension nodes that take effect on the next app launch. [Learn more →](docs/FN.md)
 
 ### Built-in WebUI
