@@ -32,7 +32,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// A classic Zygisk module, as scanned fresh from `PATH_MODULES_DIR`.
@@ -418,14 +418,23 @@ fn clear_activation_markers(name: &str) {
 // The hot-plug transaction for these modules is instead:
 //
 //   1. swap the staged copy into the active directory (`swap_staged_module`),
-//   2. restart the framework once — init respawns zygote, and the fresh
-//      system_server picks the payload up during its own specialization,
-//   3. start the module's daemon only once that fresh system_server is up
-//      (`run_framework_activations`).
+//   2. start the module's daemon (`start_framework_daemon`) — it claims the
+//      service name the payload polls during specialization,
+//   3. then restart the framework once: init respawns zygote, the fresh
+//      system_server picks the payload up during its own specialization, and
+//      finds the daemon's proxy already claimed. Its death recipient
+//      re-claims the name and re-handshakes, so the first handshake succeeds.
+//
+// The order of 2 and 3 is the whole trick. Starting the daemon *after* the
+// restart leaves the fresh system_server without the proxy: its payload never
+// installs the bridge, the daemon's handshake fails three times, and it
+// answers with a framework restart of its own — a second restart the user
+// never asked for (measured on Vector 2.2: `No response from bridge` x3 →
+// `Restarting system_server...`).
 //
 // `hotplug_activated/<name>.framework` carries `<boot_id>:<pid>:<restarts>:<heals>`:
 // the boot the transaction belongs to, the last system_server OnyxZygisk
-// handled for this module (i.e. the one it killed, or the one it started the
+// handled for this module (i.e. the one it killed, or the one it recorded the
 // daemon against), how many framework restarts we requested, and how many
 // daemon starts we spent. Both counters are bounded, because Android init
 // escalates repeated framework restarts into a hard reboot: a module that
@@ -441,10 +450,18 @@ const MAX_FRAMEWORK_RESTARTS: u32 = 1;
 /// dying together with the framework means the module is not stabilizing on
 /// this device, and another round would only feed the restart loop.
 const MAX_FRAMEWORK_DAEMON_STARTS: u32 = 2;
-/// Grace period after a fresh system_server before its daemon is started: the
-/// payload is injected during specialization, which finishes a moment after
-/// the one-shot `SystemServerStarted` heartbeat.
-const FRAMEWORK_DAEMON_DELAY: Duration = Duration::from_secs(5);
+/// Grace period between the daemon process appearing and the framework
+/// restart. The daemon claims the service name the payload polls a moment
+/// after its JVM is up, and the payload of the *fresh* system_server only
+/// finds it when that claim happened first. The delay also has to stay well
+/// inside the window before the daemon gives up on the old framework and
+/// restarts it on its own (three one-second attempts on Vector).
+const FRAMEWORK_PROXY_CLAIM_GRACE: Duration = Duration::from_secs(2);
+/// How long to wait for the daemon process itself before restarting the
+/// framework regardless: a module whose daemon never appears still deserves
+/// its framework restart (that is what makes the payload load at all), and
+/// `run_framework_activations` will try to start the daemon afterwards.
+const FRAMEWORK_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The daemon a framework module starts, if it has one.
 ///
@@ -521,6 +538,85 @@ fn unplug_unstable_framework_module(name: &str) {
     let _ = fs::remove_file(activation_marker(name, "framework"));
     let _ = fs::remove_file(activation_marker(name, "restarted"));
     refresh_controller_info();
+}
+
+/// Starts a framework module's daemon and waits until it can have claimed its
+/// proxy service, so that the framework restart which follows hands the fresh
+/// system_server a daemon it is able to handshake with.
+///
+/// See the section comment above for why this has to run *before* the restart.
+/// Waits for a module's daemon process to show up.
+fn wait_for_daemon(module_dir: &Path, nice_name: Option<&str>, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if module_daemon_running(module_dir, nice_name) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn start_framework_daemon(name: &str, module_dir: &Path) {
+    let nice_name = framework_daemon_name(module_dir);
+    // A repeat click, or a transaction that already reached the framework that
+    // is running now, has nothing to start: `restart_framework_once` will see
+    // the marker and leave the framework alone.
+    let already_reached = current_boot_id().is_some_and(|boot_id| {
+        framework_state(name).is_some_and(|(recorded_boot, pid, _, _)| {
+            recorded_boot == boot_id && Some(pid) == pidof_system_server()
+        })
+    });
+    if already_reached && module_daemon_running(module_dir, nice_name.as_deref()) {
+        info!(
+            "Hot-plug: daemon for framework module \"{}\" is already on this framework",
+            name
+        );
+        return;
+    }
+
+    let service = module_dir.join("service.sh");
+    if service.is_file() {
+        run_module_script(module_dir, &service);
+    }
+    // Wait for the daemon `service.sh` backgrounded before starting a second
+    // one: the loser exits on the module's own lock, but its wrapper mounts a
+    // tmpfs over /data/resource-cache on the way there, which is not something
+    // to do twice for nothing.
+    let mut started = wait_for_daemon(
+        module_dir,
+        nice_name.as_deref(),
+        FRAMEWORK_DAEMON_START_TIMEOUT,
+    );
+    if !started {
+        if service.is_file() {
+            warn!(
+                "Hot-plug: daemon for framework module \"{}\" did not appear after service.sh; retrying a direct start",
+                name
+            );
+        }
+        ensure_module_daemon_started(name, module_dir);
+        started = wait_for_daemon(
+            module_dir,
+            nice_name.as_deref(),
+            FRAMEWORK_DAEMON_START_TIMEOUT,
+        );
+    }
+    if !started {
+        warn!(
+            "Hot-plug: daemon for framework module \"{}\" did not appear; restarting the framework anyway",
+            name
+        );
+        return;
+    }
+    // The process exists; its proxy claim follows once the JVM is up.
+    thread::sleep(FRAMEWORK_PROXY_CLAIM_GRACE);
+    info!(
+        "Hot-plug: daemon for framework module \"{}\" is up; restarting the framework",
+        name
+    );
 }
 
 /// Restarts the framework once so a freshly swapped framework module is
@@ -638,11 +734,12 @@ fn run_framework_activations() {
         }
         let nice_name = framework_daemon_name(&module_dir);
         if pid != 0 && module_daemon_running(&module_dir, nice_name.as_deref()) {
-            // The daemon survived the framework restart on its own (its death
-            // recipient re-handshakes); just record the new framework so we do
-            // not count this restart against the module.
+            // The daemon was started before the restart we requested, so it is
+            // already holding the proxy the fresh system_server's payload polls
+            // for, and its death recipient has re-handshaken on its own. Record
+            // the new framework so this restart is not counted twice.
             info!(
-                "Hot-plug: daemon for \"{}\" survived the framework restart; recording system_server {}",
+                "Hot-plug: framework module \"{}\" holds system_server {}",
                 name, current_pid
             );
             write_framework_state(&name, &recorded_boot, current_pid, restarts, heals);
@@ -678,14 +775,12 @@ fn run_framework_activations() {
         let name_clone = name.clone();
         let dir_clone = module_dir.clone();
         thread::spawn(move || {
-            // The payload is injected during specialization, so the bridge only
-            // exists a moment after the heartbeat that led us here.
-            thread::sleep(FRAMEWORK_DAEMON_DELAY);
-            let service = dir_clone.join("service.sh");
-            if service.is_file() {
-                run_module_script(&dir_clone, &service);
-            }
-            ensure_module_daemon_started(&name_clone, &dir_clone);
+            // A repair path: the daemon is gone after a framework restart that
+            // was not ours (or ours, and it died with the old framework), so
+            // start it against the framework that is up now. Its proxy claim is
+            // late for this system_server, which is why this is the last resort
+            // rather than the normal activation order.
+            start_framework_daemon(&name_clone, &dir_clone);
             write_activation_marker(&name_clone, "service");
             let _ = fs::write(activation_marker(&name_clone, "state"), b"1");
             let _ = fs::remove_file(activation_marker(&name_clone, "applying"));
@@ -1330,6 +1425,11 @@ pub fn apply_hotplug(tmp_path: Option<&str>, name: &str) -> Result<()> {
         write_activation_marker(name, "post_fs_data");
         let _ = fs::remove_file(activation_marker(name, "applying"));
         fs::write(activation_marker(name, "state"), b"1")?;
+        // Daemon first, framework restart second: the daemon has to be holding
+        // its proxy before the fresh system_server specializes (see the
+        // framework section comment).
+        start_framework_daemon(name, &active_dir);
+        write_activation_marker(name, "service");
         refresh_controller_info();
         return restart_framework_once(name);
     }
