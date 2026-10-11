@@ -77,6 +77,9 @@ pub fn main(tmp_path: Option<&str>) -> Result<()> {
     // Cross-boot circuit breaker: resolve a hot-plug restart guard left over
     // from a crashed session BEFORE any module library is served.
     resolve_stale_restart_guard();
+    // A framework activation marker from an earlier kernel boot is complete:
+    // the root solution's boot stage already started that daemon.
+    sweep_stale_framework_markers();
     // One-time snapshot for the startup log only; every actual request re-scans
     // fresh (see `load_modules`), so this does not need to stay in sync with
     // modules installed/removed later. activate=false: must not run/rename a
@@ -159,6 +162,10 @@ fn handle_connection(mut stream: UnixStream, context: Arc<AppContext>) -> Result
             // Deferred service.sh of hot-plugged staged modules (lspd etc.)
             // can only start now, on a prepared framework.
             run_pending_staged_services();
+            // Framework modules are the other way round: their daemon may only
+            // be started once the fresh system_server holds the injected
+            // payload, i.e. after this very event.
+            run_framework_activations();
         }
         // Heavier actions are spawned into a separate thread.
         _ => {
@@ -381,8 +388,341 @@ fn write_activation_marker(name: &str, suffix: &str) {
 }
 
 fn clear_activation_markers(name: &str) {
-    for suffix in ["post_fs_data", "service", "restarted", "live_signaled", "applying", "state"] {
+    for suffix in [
+        "post_fs_data",
+        "service",
+        "restarted",
+        "live_signaled",
+        "applying",
+        "state",
+        "framework",
+    ] {
         let _ = fs::remove_file(activation_marker(name, suffix));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Framework modules (Vector / LSPosed)
+// ---------------------------------------------------------------------------
+//
+// A framework module ships its own privileged daemon (`vectord`, `lspd`, …)
+// that handshakes with a binder bridge its Zygisk payload installs *inside*
+// system_server. That payload is only effective when it is loaded at the
+// point zygote forks system_server; a late live load into an already running
+// framework cannot complete the handshake, and the daemon answers a failed
+// handshake by restarting the framework itself (`restartSystemServer`).
+// Live-loading such a module therefore never activates it — it only hands
+// the daemon a system_server it can never bind to, and the restart that
+// follows then kills the daemon that was supposed to recover.
+//
+// The hot-plug transaction for these modules is instead:
+//
+//   1. swap the staged copy into the active directory (`swap_staged_module`),
+//   2. restart the framework once — init respawns zygote, and the fresh
+//      system_server picks the payload up during its own specialization,
+//   3. start the module's daemon only once that fresh system_server is up
+//      (`run_framework_activations`).
+//
+// `hotplug_activated/<name>.framework` carries `<boot_id>:<pid>:<restarts>:<heals>`:
+// the boot the transaction belongs to, the last system_server OnyxZygisk
+// handled for this module (i.e. the one it killed, or the one it started the
+// daemon against), how many framework restarts we requested, and how many
+// daemon starts we spent. Both counters are bounded, because Android init
+// escalates repeated framework restarts into a hard reboot: a module that
+// cannot stabilize is unplugged instead of being retried forever.
+
+/// Daemon names that mean "this module owns a binder bridge inside
+/// system_server", and therefore must never be live-loaded.
+const FRAMEWORK_DAEMON_NAMES: [&str; 2] = ["vectord", "lspd"];
+/// Framework restarts OnyxZygisk may request for one module per boot.
+const MAX_FRAMEWORK_RESTARTS: u32 = 1;
+/// Daemon starts allowed for one module per boot (the first one, plus one
+/// retry after a framework restart it did not survive). A daemon that keeps
+/// dying together with the framework means the module is not stabilizing on
+/// this device, and another round would only feed the restart loop.
+const MAX_FRAMEWORK_DAEMON_STARTS: u32 = 2;
+/// Grace period after a fresh system_server before its daemon is started: the
+/// payload is injected during specialization, which finishes a moment after
+/// the one-shot `SystemServerStarted` heartbeat.
+const FRAMEWORK_DAEMON_DELAY: Duration = Duration::from_secs(5);
+
+/// The daemon a framework module starts, if it has one.
+///
+/// Recognised through the `--nice-name=` its wrapper passes to `app_process`
+/// (Vector ships `<dir>/daemon`, LSPosed ships `bin/lspd`), which is the same
+/// signal `ensure_module_daemon_started` uses to track the running process.
+/// A module that execs `app_process` straight from `service.sh` is matched by
+/// that name appearing next to `app_process`, so a mere mention in a comment
+/// cannot turn an ordinary module into a framework one.
+fn framework_daemon_name(module_dir: &Path) -> Option<String> {
+    let mut wrappers = vec![module_dir.join("daemon")];
+    if let Ok(entries) = fs::read_dir(module_dir.join("bin")) {
+        wrappers.extend(entries.flatten().map(|entry| entry.path()));
+    }
+    for wrapper in wrappers {
+        let Ok(text) = fs::read_to_string(&wrapper) else {
+            continue;
+        };
+        if let Some(name) = parse_daemon_nice_name(&text) {
+            if FRAMEWORK_DAEMON_NAMES.contains(&name.as_str()) {
+                return Some(name);
+            }
+        }
+    }
+    let service = fs::read_to_string(module_dir.join("service.sh")).ok()?;
+    if !service.contains("app_process") {
+        return None;
+    }
+    FRAMEWORK_DAEMON_NAMES
+        .iter()
+        .find(|name| service.contains(**name))
+        .map(|name| (*name).to_string())
+}
+
+fn is_framework_module(module_dir: &Path) -> bool {
+    framework_daemon_name(module_dir).is_some()
+}
+
+/// Parses `boot_id:pid:restarts:heals` — see the section comment above.
+fn framework_state(name: &str) -> Option<(String, i32, u32, u32)> {
+    let text = fs::read_to_string(activation_marker(name, "framework")).ok()?;
+    let mut parts = text.trim().split(':');
+    let boot_id = parts.next()?.to_string();
+    let pid = parts.next()?.parse().ok()?;
+    let restarts = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    let heals = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    (!boot_id.is_empty()).then_some((boot_id, pid, restarts, heals))
+}
+
+fn write_framework_state(name: &str, boot_id: &str, pid: i32, restarts: u32, heals: u32) {
+    let _ = fs::write(
+        activation_marker(name, "framework"),
+        format!("{boot_id}:{pid}:{restarts}:{heals}"),
+    );
+}
+
+/// Unplug a framework module that could not stabilize after its framework
+/// restart. Removing the per-module opt-in stops it being served to newly
+/// forked processes; `crash_blocked` leaves the reason in the work directory
+/// for the WebUI and the logs. An already-resident copy in a running process
+/// cannot be undone, exactly like a normal unplug.
+fn unplug_unstable_framework_module(name: &str) {
+    error!(
+        "Hot-plug: framework module \"{}\" did not stabilize on the restarted framework; unplugging it",
+        name
+    );
+    let _ = fs::remove_file(
+        Path::new(TMP_PATH.get().unwrap())
+            .join("hotplug")
+            .join(name),
+    );
+    let _ = fs::write(activation_marker(name, "state"), b"0");
+    let _ = fs::write(activation_marker(name, "crash_blocked"), b"1");
+    let _ = fs::remove_file(activation_marker(name, "framework"));
+    let _ = fs::remove_file(activation_marker(name, "restarted"));
+    refresh_controller_info();
+}
+
+/// Restarts the framework once so a freshly swapped framework module is
+/// injected at the fresh system_server fork point.
+///
+/// Killing system_server is the cheap framework restart (~15 s; init respawns
+/// zygote and with it system_server). The request is recorded — with the boot
+/// id, so a later boot can tell our own restart apart from a user reboot —
+/// before the kill, and it is idempotent: a second click, or a duplicate
+/// bridge delivery, sees the in-flight marker and does not restart again.
+fn restart_framework_once(name: &str) -> Result<()> {
+    // Serialize marker inspection and the kill across the 32/64-bit daemons
+    // plus the WebUI CLI process, exactly like the staged swap does.
+    let _lock = acquire_hotplug_lock().context("failed to lock the framework restart")?;
+    let Some(boot_id) = current_boot_id() else {
+        bail!("kernel boot id is unavailable; refusing an unguarded framework restart");
+    };
+    if let Some((recorded_boot, pid, restarts, _)) = framework_state(name) {
+        if recorded_boot == boot_id {
+            if Some(pid) == pidof_system_server() {
+                info!(
+                    "Hot-plug: framework module \"{}\" is already active on this framework",
+                    name
+                );
+                return Ok(());
+            }
+            if restarts >= MAX_FRAMEWORK_RESTARTS {
+                // The restart this module gets this boot was already requested;
+                // `run_framework_activations` starts its daemon once the fresh
+                // system_server is up.
+                info!(
+                    "Hot-plug: framework restart for \"{}\" is already in flight",
+                    name
+                );
+                return Ok(());
+            }
+        }
+    }
+    let Some(pid) = pidof_system_server() else {
+        bail!("system_server pid not found; cannot restart the framework");
+    };
+    let restarts = framework_state(name)
+        .filter(|(recorded_boot, _, _, _)| recorded_boot == &boot_id)
+        .map(|(_, _, restarts, _)| restarts)
+        .unwrap_or(0)
+        + 1;
+    // Record the system_server that is about to die. Until a different one
+    // appears, `run_framework_activations` must not start the daemon: doing so
+    // against the framework we are about to kill is exactly the failed
+    // handshake this whole path exists to avoid.
+    write_framework_state(name, &boot_id, pid, restarts, 0);
+    info!(
+        "Hot-plug: restarting the framework to activate framework module \"{}\" (system_server pid {})",
+        name, pid
+    );
+    // SAFETY: plain signal delivery to a pid resolved a moment ago.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    Ok(())
+}
+
+/// Starts the daemon of every framework module waiting for its framework
+/// restart, and heals one whose daemon did not survive that restart.
+///
+/// Called from the one-shot `SystemServerStarted` event and opportunistically
+/// from every `load_modules()` scan, so a daemon start that was missed (the
+/// event fired before this daemon process existed) is still picked up on the
+/// very next fork — the same self-healing rule `system_server_ready` uses.
+fn run_framework_activations() {
+    if !system_server_ready() {
+        return;
+    }
+    let markers = Path::new(TMP_PATH.get().unwrap()).join("hotplug_activated");
+    let Ok(entries) = fs::read_dir(&markers) else {
+        return;
+    };
+    // Cheap directory scan before anything else: this runs on every module
+    // scan, i.e. on every app fork, while `pidof_system_server()` walks all of
+    // /proc. Nothing pending means nothing to do.
+    let pending: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .strip_suffix(".framework")
+                .map(str::to_string)
+        })
+        .collect();
+    if pending.is_empty() {
+        return;
+    }
+    let Some(current_pid) = pidof_system_server() else {
+        return;
+    };
+    let boot_id = current_boot_id();
+    for name in pending {
+        let marker = activation_marker(&name, "framework");
+        let Some((recorded_boot, pid, restarts, heals)) = framework_state(&name) else {
+            let _ = fs::remove_file(&marker);
+            continue;
+        };
+        if boot_id.as_deref() != Some(recorded_boot.as_str()) {
+            // The kernel restarted: the root solution's own boot stage owns
+            // this module now (its service.sh ran), so our transaction is over.
+            let _ = fs::remove_file(&marker);
+            continue;
+        }
+        if pid == current_pid {
+            continue; // The daemon was already started against this framework.
+        }
+        let module_dir = Path::new(constants::PATH_MODULES_DIR).join(&name);
+        if !module_dir.is_dir() {
+            let _ = fs::remove_file(&marker);
+            continue;
+        }
+        let nice_name = framework_daemon_name(&module_dir);
+        if pid != 0 && module_daemon_running(&module_dir, nice_name.as_deref()) {
+            // The daemon survived the framework restart on its own (its death
+            // recipient re-handshakes); just record the new framework so we do
+            // not count this restart against the module.
+            info!(
+                "Hot-plug: daemon for \"{}\" survived the framework restart; recording system_server {}",
+                name, current_pid
+            );
+            write_framework_state(&name, &recorded_boot, current_pid, restarts, heals);
+            continue;
+        }
+        let heals = heals + 1;
+        if heals > MAX_FRAMEWORK_DAEMON_STARTS {
+            unplug_unstable_framework_module(&name);
+            continue;
+        }
+        // Claim the start atomically: many forks reach this concurrently.
+        let applying = activation_marker(&name, "applying");
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&applying)
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                warn!(
+                    "Hot-plug: failed to claim the framework daemon start for \"{}\": {}",
+                    name, e
+                );
+                continue;
+            }
+        }
+        write_framework_state(&name, &recorded_boot, current_pid, restarts, heals);
+        info!(
+            "Hot-plug: scheduling daemon start for framework module \"{}\" on system_server {}",
+            name, current_pid
+        );
+        let name_clone = name.clone();
+        let dir_clone = module_dir.clone();
+        thread::spawn(move || {
+            // The payload is injected during specialization, so the bridge only
+            // exists a moment after the heartbeat that led us here.
+            thread::sleep(FRAMEWORK_DAEMON_DELAY);
+            let service = dir_clone.join("service.sh");
+            if service.is_file() {
+                run_module_script(&dir_clone, &service);
+            }
+            ensure_module_daemon_started(&name_clone, &dir_clone);
+            write_activation_marker(&name_clone, "service");
+            let _ = fs::write(activation_marker(&name_clone, "state"), b"1");
+            let _ = fs::remove_file(activation_marker(&name_clone, "applying"));
+            let _ = fs::remove_file(activation_marker(&name_clone, "crash_blocked"));
+            refresh_controller_info();
+            info!(
+                "Hot-plug: framework module \"{}\" daemon started on system_server {}",
+                name_clone, current_pid
+            );
+        });
+    }
+}
+
+/// Drops framework activation markers left over from earlier kernel boots.
+///
+/// On this boot the root solution's own boot stage already ran the module's
+/// service.sh, so nothing is pending — a leftover marker would only make
+/// `run_framework_activations` start a second daemon for a module that is
+/// already running.
+fn sweep_stale_framework_markers() {
+    let Some(boot_id) = current_boot_id() else {
+        return;
+    };
+    let markers = Path::new(TMP_PATH.get().unwrap()).join("hotplug_activated");
+    let Ok(entries) = fs::read_dir(&markers) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        let Some(name) = fname.strip_suffix(".framework") else {
+            continue;
+        };
+        let recorded_boot = framework_state(name).map(|(boot, _, _, _)| boot);
+        if recorded_boot.as_deref() != Some(boot_id.as_str()) {
+            let _ = fs::remove_file(entry.path());
+            let _ = fs::remove_file(activation_marker(name, "restarted"));
+        }
     }
 }
 
@@ -606,6 +946,7 @@ fn load_modules(activate: bool) -> Result<Vec<Module>> {
     // pending.
     if activate {
         run_pending_staged_services();
+        run_framework_activations();
     }
 
     let mut modules = Vec::new();
@@ -774,14 +1115,20 @@ fn ensure_module_daemon_started(name: &str, module_dir: &Path) {
         .and_then(|file| file.try_clone().ok())
         .map(Stdio::from)
         .unwrap_or_else(Stdio::null);
-    let stderr = log_file
-        .map(Stdio::from)
-        .unwrap_or_else(Stdio::null);
+    let stderr = log_file.map(Stdio::from).unwrap_or_else(Stdio::null);
 
     let mut command = Command::new("sh");
     command.arg(&daemon);
-    if script.contains("system-server-max-retry") || nice_name.as_deref() == Some("vectord") {
-        command.arg("--system-server-max-retry=3");
+    if script.contains("system-server-max-retry")
+        || nice_name
+            .as_deref()
+            .is_some_and(|name| FRAMEWORK_DAEMON_NAMES.contains(&name))
+    {
+        // Cap the daemon's own restart budget. OnyxZygisk owns framework
+        // restarts for these modules (see `run_framework_activations`), so the
+        // daemon's default of 3 would stack on top of ours and feed exactly the
+        // init-escalated boot loop the restart budget exists to prevent.
+        command.arg("--system-server-max-retry=1");
     }
 
     match command
@@ -867,6 +1214,32 @@ fn activate_staged_module(name: &str, module_dir: &Path) {
     };
 
     let name = name.to_string();
+
+    // Framework modules never activate through a live load (see the framework
+    // section above): restart the framework once and let the daemon be started
+    // against the fresh system_server.
+    if is_framework_module(&dir) {
+        let name_clone = name.clone();
+        info!(
+            "Hot-plug: framework module \"{}\" swapped in; restarting the framework to activate it",
+            name
+        );
+        std::thread::spawn(move || {
+            let post = dir.join("post-fs-data.sh");
+            if post.is_file() {
+                run_module_script(&dir, &post);
+            }
+            write_activation_marker(&name_clone, "post_fs_data");
+            let _ = fs::write(activation_marker(&name_clone, "state"), b"1");
+            let _ = fs::remove_file(activation_marker(&name_clone, "applying"));
+            refresh_controller_info();
+            if let Err(e) = restart_framework_once(&name_clone) {
+                warn!("Hot-plug: {:#}", e);
+            }
+        });
+        return;
+    }
+
     info!(
         "Hot-plug: scheduling lifecycle scripts for swapped module \"{}\"",
         name
@@ -941,6 +1314,26 @@ pub fn apply_hotplug(tmp_path: Option<&str>, name: &str) -> Result<()> {
         bail!("module {name} is not installed in the active directory");
     }
 
+    // Framework modules (Vector / LSPosed) can never activate through a live
+    // load: their payload has to be in system_server from its fork point. Swap
+    // the staged copy in and restart the framework once — the fresh
+    // system_server picks the payload up during specialization, and
+    // `run_framework_activations` starts the daemon against it. Running their
+    // service.sh against the old system_server instead is what hands the
+    // daemon a framework it can never bind to, and the restart it then
+    // performs itself is unguarded.
+    if enabled && is_framework_module(&active_dir) {
+        let post = active_dir.join("post-fs-data.sh");
+        if post.is_file() {
+            run_module_script(&active_dir, &post);
+        }
+        write_activation_marker(name, "post_fs_data");
+        let _ = fs::remove_file(activation_marker(name, "applying"));
+        fs::write(activation_marker(name, "state"), b"1")?;
+        refresh_controller_info();
+        return restart_framework_once(name);
+    }
+
     if swapped {
         let post = active_dir.join("post-fs-data.sh");
         if post.is_file() {
@@ -967,6 +1360,13 @@ pub fn apply_hotplug(tmp_path: Option<&str>, name: &str) -> Result<()> {
     let state_marker = activation_marker(name, "state");
     let target_state = if enabled { "1" } else { "0" };
     fs::write(&state_marker, target_state.as_bytes())?;
+
+    if !enabled {
+        // An unplugged framework module has no pending activation any more;
+        // a stale marker would only make the next scan try to start a daemon
+        // for a module that is switched off.
+        let _ = fs::remove_file(activation_marker(name, "framework"));
+    }
 
     refresh_controller_info();
     if enabled && !signal_system_server_hotplug(name, true) {
@@ -1278,6 +1678,12 @@ fn run_pending_staged_services() {
             continue;
         }
         let active_dir = Path::new(constants::PATH_MODULES_DIR).join(name);
+        // Framework modules are activated by restarting the framework first;
+        // running their service.sh against the old system_server only makes
+        // their daemon restart the framework itself, unguarded.
+        if is_framework_module(&active_dir) {
+            continue;
+        }
         let has_so = ["zygisk/arm64-v8a.so", "zygisk/armeabi-v7a.so"]
             .iter()
             .any(|p| active_dir.join(p).exists());
@@ -1288,11 +1694,18 @@ fn run_pending_staged_services() {
         // load_modules() is called concurrently by many forks, so checking a
         // marker without creating it here schedules service.sh many times.
         let applying = markers.join(format!("{name}.applying"));
-        match fs::OpenOptions::new().write(true).create_new(true).open(&applying) {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&applying)
+        {
             Ok(_) => {}
             Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
             Err(e) => {
-                warn!("Hot-plug: failed to claim deferred service for \"{}\": {}", name, e);
+                warn!(
+                    "Hot-plug: failed to claim deferred service for \"{}\": {}",
+                    name, e
+                );
                 continue;
             }
         }

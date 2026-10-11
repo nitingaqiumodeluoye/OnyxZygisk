@@ -49,7 +49,7 @@
 	<string name="modules_pending_update">更新が保留中</string>
 	<string name="modules_hotplug_control">保留中の更新を今すぐ適用</string>
 	<string name="modules_hotplug_toggle">ホットプラグ済み、取り外す</string>
-	<string name="modules_hotplug_applied">適用しました。有効化のため再起動します。</string>
+	<string name="modules_hotplug_applied">適用しました。フレームワークモジュール（Vector/LSPosed）は framework を再起動して有効化します。</string>
 	<string name="modules_master_off">ホットプラグは無効です。保留中の更新は再起動後に適用されます。</string>
 	<string name="fn_section">FN ノード</string>
 	<string name="fn_empty">FN ノードがありません。</string>

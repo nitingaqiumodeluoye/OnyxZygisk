@@ -49,7 +49,7 @@
 	<string name="modules_pending_update">Update staged</string>
 	<string name="modules_hotplug_control">Apply the staged update now</string>
 	<string name="modules_hotplug_toggle">Hot-plugged, unplug again</string>
-	<string name="modules_hotplug_applied">Applied. The device will reboot to finish activation.</string>
+	<string name="modules_hotplug_applied">Applied. Framework modules (Vector/LSPosed) restart the framework to activate.</string>
 	<string name="modules_master_off">Hot-plug is off, so staged updates wait for a reboot.</string>
 	<string name="fn_section">FN nodes</string>
 	<string name="fn_empty">No FN nodes installed.</string>

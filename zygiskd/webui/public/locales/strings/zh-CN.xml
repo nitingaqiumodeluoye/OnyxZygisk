@@ -49,7 +49,7 @@
 	<string name="modules_pending_update">有更新待生效</string>
 	<string name="modules_hotplug_control">立即应用待生效的更新</string>
 	<string name="modules_hotplug_toggle">已热插拔，可拔除</string>
-	<string name="modules_hotplug_applied">已应用，设备即将重启以完成激活。</string>
+	<string name="modules_hotplug_applied">已应用。框架模块（Vector/LSPosed）会重启 framework 完成激活。</string>
 	<string name="modules_master_off">热插拔已关闭，待生效的更新将在重启后应用。</string>
 	<string name="fn_section">FN 节点</string>
 	<string name="fn_empty">没有 FN 节点。</string>
