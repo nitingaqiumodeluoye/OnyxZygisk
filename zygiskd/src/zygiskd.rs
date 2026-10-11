@@ -1569,7 +1569,11 @@ pub fn apply_hotplug(tmp_path: Option<&str>, name: &str) -> Result<()> {
         start_framework_daemon(name, &active_dir, swapped);
         write_activation_marker(name, "service");
         refresh_controller_info();
-        return restart_framework_once(name);
+        let restarted = restart_framework_once(name);
+        if swapped && restarted.is_ok() {
+            clear_pending_update_marker(name, &active_dir);
+        }
+        return restarted;
     }
 
     if swapped {
@@ -1610,7 +1614,42 @@ pub fn apply_hotplug(tmp_path: Option<&str>, name: &str) -> Result<()> {
     if enabled && !signal_system_server_hotplug(name, true) {
         bail!("module list updated for new apps; system_server live loading is unavailable");
     }
+    if swapped {
+        clear_pending_update_marker(name, &active_dir);
+    }
     Ok(())
+}
+
+/// Removes the root solution's "an update is installed, reboot to apply it"
+/// marker from the module directory.
+///
+/// APatch's installer writes it while booted (`mktouch
+/// $NVBASE/modules/$MODID/update`, apd/assets/installer.sh) and `apd`'s module
+/// list reports `update: true` for as long as it exists, which is what makes
+/// the manager show an "Updated" badge. Nothing but the root solution's own
+/// boot stage ever deletes it (`prune_modules()` at post-fs-data), so a module
+/// hot-plugged without a reboot keeps claiming it needs one: the staged copy is
+/// already the active copy and already hooked into system_server.
+///
+/// Only called once the activation actually succeeded. If it did not, the
+/// marker is deliberately left alone — it still correctly says "reboot to
+/// apply", and a reboot does apply it (the content is in the active directory
+/// either way).
+fn clear_pending_update_marker(name: &str, module_dir: &Path) {
+    let marker = module_dir.join("update");
+    if !marker.exists() {
+        return;
+    }
+    match fs::remove_file(&marker) {
+        Ok(()) => info!(
+            "Hot-plug: cleared the pending-update marker of \"{}\" (the staged update is live now)",
+            name
+        ),
+        Err(e) => warn!(
+            "Hot-plug: could not clear the pending-update marker of \"{}\": {}",
+            name, e
+        ),
+    }
 }
 
 /// Opted-in staged modules (master switch on, staged copy complete, per-module
