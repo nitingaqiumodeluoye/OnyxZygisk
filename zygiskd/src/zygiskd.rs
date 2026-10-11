@@ -462,6 +462,9 @@ const FRAMEWORK_PROXY_CLAIM_GRACE: Duration = Duration::from_secs(2);
 /// its framework restart (that is what makes the payload load at all), and
 /// `run_framework_activations` will try to start the daemon afterwards.
 const FRAMEWORK_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a framework module's old daemon gets to exit on SIGTERM before it
+/// is killed outright, after a swapped copy replaced the code it is running.
+const FRAMEWORK_DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// The daemon a framework module starts, if it has one.
 ///
@@ -559,32 +562,38 @@ fn wait_for_daemon(module_dir: &Path, nice_name: Option<&str>, timeout: Duration
     }
 }
 
-fn start_framework_daemon(name: &str, module_dir: &Path) {
+/// Starts the daemon of a framework module, or leaves the one it already has
+/// alone.
+///
+/// `swapped` means the module's code on disk was just replaced. A daemon that
+/// is already running then belongs to the *old* copy, and it speaks the
+/// module's private IPC with a payload we are about to hand the new one, so it
+/// is stopped and replaced. Without a swap there is nothing for a second
+/// daemon to do: starting one anyway is what made a re-toggle leave two Vector
+/// daemons racing for the `serial` proxy and for `.cli_sock`.
+fn start_framework_daemon(name: &str, module_dir: &Path, swapped: bool) {
     let nice_name = framework_daemon_name(module_dir);
-    // A repeat click, or a transaction that already reached the framework that
-    // is running now, has nothing to start: `restart_framework_once` will see
-    // the marker and leave the framework alone.
-    let already_reached = current_boot_id().is_some_and(|boot_id| {
-        framework_state(name).is_some_and(|(recorded_boot, pid, _, _)| {
-            recorded_boot == boot_id && Some(pid) == pidof_system_server()
-        })
-    });
-    if already_reached && module_daemon_running(module_dir, nice_name.as_deref()) {
-        info!(
-            "Hot-plug: daemon for framework module \"{}\" is already on this framework",
-            name
-        );
-        return;
+    let running = module_daemon_pids(module_dir, nice_name.as_deref());
+    if !running.is_empty() {
+        if !swapped {
+            info!(
+                "Hot-plug: daemon for framework module \"{}\" is already running (pid {:?}); not starting another",
+                name, running
+            );
+            return;
+        }
+        stop_module_daemon(name, module_dir, nice_name.as_deref());
     }
 
     let service = module_dir.join("service.sh");
     if service.is_file() {
         run_module_script(module_dir, &service);
     }
-    // Wait for the daemon `service.sh` backgrounded before starting a second
-    // one: the loser exits on the module's own lock, but its wrapper mounts a
-    // tmpfs over /data/resource-cache on the way there, which is not something
-    // to do twice for nothing.
+    // Wait for the daemon `service.sh` backgrounded, so the fallback below does
+    // not start a second one. Do not lean on the module's own single-instance
+    // lock to sort that out: on 2026-10-11 a re-toggle left two Vector daemons
+    // running at once, the second of which had taken over the `serial` proxy
+    // and `.cli_sock` and then died, breaking both.
     let mut started = wait_for_daemon(
         module_dir,
         nice_name.as_deref(),
@@ -779,8 +788,9 @@ fn run_framework_activations() {
             // was not ours (or ours, and it died with the old framework), so
             // start it against the framework that is up now. Its proxy claim is
             // late for this system_server, which is why this is the last resort
-            // rather than the normal activation order.
-            start_framework_daemon(&name_clone, &dir_clone);
+            // rather than the normal activation order. Nothing was swapped, so
+            // if a daemon turned up since the check above it is left alone.
+            start_framework_daemon(&name_clone, &dir_clone, false);
             write_activation_marker(&name_clone, "service");
             let _ = fs::write(activation_marker(&name_clone, "state"), b"1");
             let _ = fs::remove_file(activation_marker(&name_clone, "applying"));
@@ -1214,12 +1224,14 @@ fn safe_cmdline(pid: i32) -> Option<Vec<u8>> {
     }
 }
 
-fn process_cmdline_matches<F>(mut pred: F) -> bool
+/// The pids of every process whose command line matches `pred`.
+fn matching_cmdline_pids<F>(mut pred: F) -> Vec<i32>
 where
     F: FnMut(&[String]) -> bool,
 {
+    let mut pids = Vec::new();
     let Ok(dir) = fs::read_dir("/proc") else {
-        return false;
+        return pids;
     };
     for entry in dir.flatten() {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
@@ -1234,15 +1246,20 @@ where
             .map(|s| String::from_utf8_lossy(s).into_owned())
             .collect();
         if pred(&args) {
-            return true;
+            pids.push(pid);
         }
     }
-    false
+    pids
 }
 
-fn module_daemon_running(module_dir: &Path, nice_name: Option<&str>) -> bool {
+/// The pids of the module's daemon.
+///
+/// Its argv[0] is the `--nice-name=` from the module's own `daemon` wrapper
+/// (app_process replaces argv[0] with it), so match that first and fall back to
+/// the wrapper's path.
+fn module_daemon_pids(module_dir: &Path, nice_name: Option<&str>) -> Vec<i32> {
     let daemon_path = module_dir.join("daemon").to_string_lossy().into_owned();
-    process_cmdline_matches(|args| {
+    matching_cmdline_pids(|args| {
         if let Some(first) = args.first() {
             if nice_name.is_some_and(|name| first == name) {
                 return true;
@@ -1250,6 +1267,44 @@ fn module_daemon_running(module_dir: &Path, nice_name: Option<&str>) -> bool {
         }
         args.iter().any(|arg| arg == &daemon_path)
     })
+}
+
+fn module_daemon_running(module_dir: &Path, nice_name: Option<&str>) -> bool {
+    !module_daemon_pids(module_dir, nice_name).is_empty()
+}
+
+/// Stops the module's daemon so a freshly swapped copy can replace it.
+///
+/// A framework module's daemon and its Zygisk payload speak the module's own
+/// IPC, so leaving the old daemon behind after an update would hand the new
+/// payload a partner it cannot talk to. This is only safe because the caller
+/// restarts the framework anyway, so a daemon stop is already in the plan.
+fn stop_module_daemon(name: &str, module_dir: &Path, nice_name: Option<&str>) {
+    let pids = module_daemon_pids(module_dir, nice_name);
+    if pids.is_empty() {
+        return;
+    }
+    warn!(
+        "Hot-plug: stopping {} old daemon process(es) of framework module \"{}\" so the swapped copy can take over: {:?}",
+        pids.len(),
+        name,
+        pids
+    );
+    for pid in &pids {
+        // SAFETY: plain signal delivery to pids resolved a moment ago.
+        unsafe { libc::kill(*pid, libc::SIGTERM) };
+    }
+    let deadline = Instant::now() + FRAMEWORK_DAEMON_STOP_TIMEOUT;
+    while Instant::now() < deadline {
+        if module_daemon_pids(module_dir, nice_name).is_empty() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    for pid in &pids {
+        // SAFETY: plain signal delivery to pids resolved a moment ago.
+        unsafe { libc::kill(*pid, libc::SIGKILL) };
+    }
 }
 
 /// Some modules start a long-lived daemon from service.sh and swallow its
@@ -1511,7 +1566,7 @@ pub fn apply_hotplug(tmp_path: Option<&str>, name: &str) -> Result<()> {
         // Daemon first, framework restart second: the daemon has to be holding
         // its proxy before the fresh system_server specializes (see the
         // framework section comment).
-        start_framework_daemon(name, &active_dir);
+        start_framework_daemon(name, &active_dir, swapped);
         write_activation_marker(name, "service");
         refresh_controller_info();
         return restart_framework_once(name);
